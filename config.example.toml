@@ -1,0 +1,21 @@
+# session-graph keybindings
+# Edit this template, then apply it: node src/install.js setup-keys
+# To keep git updates clean, customize the installed block in Herdr config
+# instead, then run: herdr server reload-config
+#
+# The action ids are qualified with the plugin id:
+#   huluhlu.session-graph.open        open the graph overlay
+#   huluhlu.session-graph.setup-keys  rewrite this block
+#   huluhlu.session-graph.remove-keys delete this block
+
+[[keys.command]]
+key = "prefix+g"
+type = "plugin_action"
+command = "huluhlu.session-graph.open"
+description = "session graph"
+
+[[keys.command]]
+key = "prefix+shift+g"
+type = "plugin_action"
+command = "huluhlu.session-graph.setup-keys"
+description = "rebind session graph keys"

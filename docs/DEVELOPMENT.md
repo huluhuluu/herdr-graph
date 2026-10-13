@@ -1,0 +1,83 @@
+# Development notes / 开发说明
+
+Current implementation notes, consolidated from the original design and review.
+These describe v0.1; planned features are not treated as delivered features.
+
+## Modules
+
+| File | Responsibility |
+| --- | --- |
+| `herdr-plugin.toml` | Open, setup-keys, remove-keys actions and the overlay pane |
+| `config.example.toml` | Template for the managed keybinding block |
+| `install.sh` / `install.ps1` | Portable entry points to the shared lifecycle manager |
+| `src/graph.js` | App state, rendering, history search, native rename, jump, resume, fork |
+| `src/loader.js` / `src/loader-worker.js` | Worker lifecycle, current-session-first loading, incremental directory catalog and fork details |
+| `src/catalog.js` | Directory normalization, agent/search filters, grouped and time-sorted rows |
+| `src/relations.js` | Native session-parent trees, context previews, fork turn numbers and UTC source times |
+| `src/ui.js` | ANSI screen buffer, style composition, raw keys |
+| `src/util.js` | Display width, wrapping, file traversal and header reads |
+| `src/noise.js` | Filter injected context and tool-only messages |
+| `src/adapters/codex.js` | Read Codex metadata and conversation turns |
+| `src/adapters/claude.js` | Reduce Claude's message DAG to human turns |
+| `src/adapters/dst.js` | Read DST generation headers, concatenated Zstandard frames and human turns |
+| `src/adapters/index.js` | Adapter registry, saved-session catalog, lineage loading, node flattening |
+| `src/paths.js` | Remember custom agent homes in plugin config; explicit environment values win |
+| `src/native.js` | Codex App Server metadata/fork requests, Claude native titles, DST persistence leases |
+| `src/herdr.js` | Herdr CLI calls and plugin paths |
+| `src/install.js` | Install, fast-forward update, cache cleanup, uninstall and managed keys |
+| `src/store.js` | Parse cache keyed by adapter, file, modification time and size |
+
+## Data and behavior
+
+- In conversation views a node is a turn; in the history catalog it is a saved session. `sessionId` identifies its native session.
+- Codex identity comes from the rollout filename UUID, not the metadata's inherited ID.
+- Codex uses task boundaries and ordinals, with line numbers as a fallback for older records.
+- Codex lineage comes from `forked_from_id` and `forked_from_ordinal_exclusive`.
+- Claude follows `uuid` / `parentUuid`, redirects compaction boundaries, and excludes sidechains and tool-only user records.
+- Claude cross-session metadata uses `forkedFrom.sessionId` and `forkedFrom.messageUuid`.
+- The UI defaults to the current session and falls back to history when pane identity is missing or unresolved. Catalog scans metadata; `Enter` loads only the selected conversation. It includes archived Codex sessions and configured agent homes.
+- Interactive startup paints before worker creation. The captured caller snapshot supplies the initial identity; switching still validates live pane state. A worker parses the current session before scanning metadata, publishes caller-directory batches before other directories, and handles subsequent pages and relationship details. Family loads metadata first and resolves every branch's direct-parent turn in the background. Page generations discard late results after navigation; catalog updates preserve the selected native ID. Cache reads are lazy, writes occur in the worker, and quit restores the terminal and terminates the worker without a synchronous flush. Non-TTY execution retains one-frame synchronous output.
+- Family rows display `[turn N]` for every resolved edge; loading, unavailable parents, unknown anchors and read errors have separate states. Help scrolls on short terminals. Page keys move the focused tree in every scope; Home/End respect detail focus, hidden panels cannot receive focus, and Ctrl+C exits from every mode. Split terminal escape sequences are buffered before interpreting a lone Escape.
+- Search uses complete turn text, selects actual hits instead of contextual ancestors/directories, and waits for pending family transcripts when necessary. Literal case-insensitive highlighting preserves UTF-16 offsets and terminal cell widths, including matches split by wrapping. The reader locates a match once per selection/query; manual scrolling, focus changes and back navigation do not repeat that jump. Compact and detailed Family both support a full-width narrow reader; compact summaries never clamp the saved reader offset. Content focus and scrolling keys remain visible above the reader.
+- `f` opens Family (`b` remains a compatibility alias); `F` performs native fork. `d` switches between compact session structure and the detailed conversation tree. Detailed rows reuse the verified fork resolver and inherited-prefix deduplication, preserve original per-session turn numbers, and keep session headers while background transcripts arrive. Search includes prompts/replies and their ancestor paths. The structure sidebar lists new branch turns with inherited history summarized; Enter on its header reads the full session. A selected detailed turn shows its full prompt/reply, and Enter focuses the reader; narrow terminals use a full-width reader with Tab returning to the tree. Late transcript results are rejected by page generation, and toggling or returning preserves session identity.
+- History defaults to directory groups with only the caller's folder expanded. `v` switches to a flat time list, `o` reverses modification-time sorting, and `a` cycles adapter filters. Search combines with the agent filter and expands matching directories. Synthetic directory rows cannot be renamed, resumed or forked. Windows path grouping normalizes separators and case independently of the runtime OS.
+- Lineage flattening starts at the oldest loaded ancestor. Indentation increases at branch points; linear conversations stay flat.
+- Catalog rows retain native parent IDs and child metadata. Directory view nests same-agent forks under their parent when it is present in the filtered directory; time view stays flat with branch badges. Filtered, cross-directory and missing parents remain identifiable in details.
+- Relationship previews above the content read only the selected session and its direct parent through the parse cache, and stay fixed during content scroll. `f` opens the complete family under the common ancestor, preserving the selection and expanding all sibling descendants. The compact tree renders one row per session, with connectors attached directly to session names. Wide terminals put parent/fork/time/child details in a separate panel; narrow terminals put a summary below the tree. Native parent IDs define edges independently of inherited ancestor turn anchors. Missing parents have placeholder nodes. Colliding UUID prefixes use distinguishing suffixes; identifiers stay stable during folding and are searchable. Search preserves matching ancestor paths; single-child subtrees can be folded. `T` hides/shows detail timestamps without changing tree rows, and remains effective after returning between pages. Repeated `f` stays on the relationship page; only Backspace/Esc return.
+- The turn-level lineage scope reached with `t` introduces session boundary nodes, omits a verified shared turn prefix, connects child boundaries at ordinal/UUID/copy-prefix anchors and traverses the resulting edges in depth-first order. Unrecorded anchors attach to the parent boundary, never the latest turn. Claude message UUIDs include assistant/tool records belonging to the human turn; null parent keys remain roots. Relationship edges reuse the same verified anchor resolver, number turns in the direct parent's complete transcript, and show the source turn's time in UTC, never modification time as fork time.
+- Page transitions save loaded graphs and view state. `Backspace` / `Esc` return without reloading or resetting selection, filters, folds, focus or scroll; editing handles these keys before navigation. `Esc` at the first page and `q` while browsing close the overlay. Repeated history/family commands on their current page add no navigation entries. Successful native rename updates saved pages as well as the current graph.
+- On ordinary conversation turns, `Enter` calls `herdr agent focus`; Family turns focus the reader. Resume/fork target only the captured caller pane, require an idle agent of the same type, and use public `herdr pane run` for native slash commands. They never split panes or start another interactive agent. Resume checks current pane listings for duplicate writers; a missing caller is not replaced with another pane.
+- Codex `n` sends `/resume <ID>`. Codex `F` calls App Server `thread/fork`, waits for the helper to close and sends `/resume <child thread.id>` to the existing TUI. The child is persisted without a model turn; the original history is preserved. The whole saved session is copied, without a selected-turn boundary. The caller is rechecked after the async fork; failures display the saved child's ID when available.
+- Claude `n` sends `/resume <ID>`; `F` sends `/branch` only when the selected session matches the caller's native ID. DST `/resume` ignores ID arguments, so `n` opens its native picker; plugin fork is unavailable. Commands require an empty native composer. Native switching errors are shown in the agent pane.
+- Transcript parsing is local. Viewing does not mutate transcripts; resume and fork delegate changes to the agent CLI.
+- `R` renames the selected native session, with cancel and visible failure states. Codex uses the official [App Server](https://learn.chatgpt.com/docs/app-server) `thread/name/set` method, without a turn request. The client waits for its helper process to close before returning.
+- Claude uses the `custom-title` record and per-session `custom-title.json` sidecar verified against Claude Code 2.1.285. DST uses the installed backend's write lease and a `session/title` event, verified against DSH 0.1.7-rc.2. Busy DST sessions are refused; no agent source is patched. Running clients can need reopen/resume to refresh titles.
+- DST compressed history requires Node.js 24+. Each append is a separate Zstandard frame; decoding only the first frame loses history. The adapter scans frame boundaries, ignores a torn final append, and surfaces complete corrupt frames. The newest generation per session is selected; older generation rename relies on native migration.
+- DST seeded sessions retain `parentSession` and use the last tagged `session/end-seed` event's sequence as the exclusive inherited cut, verified against the installed persistence/session contracts. Parsed human turns retain event sequence ranges for locating this cut.
+- Lifecycle commands use Herdr's public CLI; they never patch Herdr source. Install preserves customized managed keys; setup-keys explicitly replaces them. Key writes require valid UTF-8, validate TOML, back up and restore on reload failure. Content is checked after validation and before rollback so edits made during either operation are preserved and reported. Conflict detection covers ordinary single/double-quoted bindings and quoted key names. Cleanup matches only parse-cache files in this plugin's state directories; config backups and repository files remain.
+
+## Outstanding issues / 待修问题
+
+| Area | Current defect or missing capability |
+| --- | --- |
+| Branch metadata | Missing parent files or fork anchors cannot be reconstructed; unknown anchors are marked |
+| Running sessions | Jump and duplicate-resume detection rely on pane identity refreshed by the poll |
+| Small terminals | Below 72 columns ordinary conversation details are hidden; both Family views support a full-width reader |
+| Refresh | New transcript content is not loaded by the pane-status poll |
+| Agents | Codex, Claude and DST are supported; more agents need explicit adapters |
+| Platforms | Windows runtime checked; Linux/macOS need native execution checks |
+
+Cache files include `VERSION` in their filename. Bump it when parser behavior changes so unchanged transcripts do not reuse old parsed results.
+
+Branch tests assert actual cross-session parent links, counts, depth-first ordering, copied-history suppression, Claude UUID/DST event anchors, independent roots, idempotent folding, missing/cyclic metadata and a 12,000-turn linear transcript. Relationship checks distinguish direct parent edges from inherited anchors, verify source turn numbers/times, selective preview parsing, fixed preview scrolling, time folding, search ancestor paths, narrow terminals and explicit back navigation. Worker tests exercise staged loading, metadata-first families, late-result rejection and interactive close. Cache version 4 invalidates parses affected by UTF-8 characters split across read buffers, as well as older DST epoch timestamps. Files changed during parsing are not cached under their new stat signature.
+
+## Checks and documentation
+
+```sh
+npm test
+npm run bench
+```
+
+The suite contains unit, lifecycle, isolated-history/native-rename/fork, local-session integration, and App behavior tests. History checks exercise grouping, filtering, both sort orders, directory keys, compact spacing, caller-only switching and refused commands. Lifecycle checks use isolated temporary Git repositories and stub Herdr calls, including failed validation/reload and concurrent edits. Native checks use isolated agent homes; they skip when the required CLI is absent. The real Codex fork test verifies a readable saved child, its parent link and unchanged original transcript before resuming. Existing session files are never renamed or forked by tests. Passing tests do not establish completeness of the outstanding features above. Benchmarks read the largest local Codex/Claude transcripts with a private temporary cache, report hits/misses and remove that directory on normal completion or a thrown error; forced termination can leave only that temporary directory, never a replaced user cache. Regression coverage also checks malformed cache/root settings and benchmark isolation.
+
+Keep `README.md` and `README.zh-CN.md` synchronized: section order, command blocks, keys, support status, limitations, links and preview must describe the same behavior. The preview uses demo data rendered by the current App.

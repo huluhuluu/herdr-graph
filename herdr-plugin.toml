@@ -1,0 +1,30 @@
+id = "huluhlu.session-graph"
+name = "Session Graph"
+version = "0.1.0"
+min_herdr_version = "0.9.0"
+description = "Browse saved agent sessions, read conversation turns, and rename native sessions"
+platforms = ["windows", "linux", "macos"]
+
+[[actions]]
+id = "open"
+title = "Session graph"
+contexts = ["pane", "global"]
+command = ["node", "src/graph.js", "open"]
+
+[[actions]]
+id = "setup-keys"
+title = "Bind session-graph keys"
+contexts = ["global"]
+command = ["node", "src/install.js", "setup-keys"]
+
+[[actions]]
+id = "remove-keys"
+title = "Unbind session-graph keys"
+contexts = ["global"]
+command = ["node", "src/install.js", "remove-keys"]
+
+[[panes]]
+id = "graph"
+title = "Session Graph"
+placement = "overlay"
+command = ["node", "src/graph.js", "pane"]
