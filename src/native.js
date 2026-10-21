@@ -44,25 +44,29 @@ function codexBinary(env = process.env) {
   return command;
 }
 
-function codexRequest(method, params, { env = process.env, binary = codexBinary(env), timeout = 20000 } = {}) {
+function codexRequest(method, params, { env = process.env, binary = codexBinary(env), timeout = 60000, spawnChild = spawn } = {}) {
   return new Promise((resolve, reject) => {
-    const child = spawn(binary, ["app-server", "--listen", "stdio://"], {
+    const child = spawnChild(binary, ["app-server", "--listen", "stdio://"], {
       env, windowsHide: true, stdio: ["pipe", "pipe", "pipe"],
     });
-    let pending = "", done = false, result, failure;
-    const timer = setTimeout(() => finish(new Error("Codex App Server timed out.")), timeout);
+    let pending = "", stderr = "", stage = "initialize", done = false, result, failure;
+    // Cold startup and local metadata operations can exceed 20 seconds.
+    // Keep a single deadline; never retry a possibly persisted fork.
+    const timer = setTimeout(() => finish(new Error(`Codex App Server timed out during ${stage}.`)), timeout);
     const send = message => child.stdin.write(JSON.stringify(message) + "\n");
     function finish(error) {
       if (done) return;
       done = true;
       failure = error;
+      if (failure && stderr.trim()) failure = new Error(`${error.message}\n${stderr.trim()}`);
       clearTimeout(timer);
       child.stdin.end();
       child.kill();
     }
     child.on("error", error => finish(error));
     child.stdin.on("error", error => finish(error));
-    child.stderr.resume();
+    child.stderr.setEncoding("utf8");
+    child.stderr.on("data", chunk => { stderr = (stderr + chunk).slice(-4096); });
     child.on("exit", code => {
       if (!done) finish(new Error(`Codex App Server exited before replying (${code}).`));
     });
@@ -77,9 +81,10 @@ function codexRequest(method, params, { env = process.env, binary = codexBinary(
         const line = pending.slice(0, end); pending = pending.slice(end + 1);
         let body;
         try { body = JSON.parse(line); } catch { continue; }
-        if (body.id !== 1 && body.id !== 2) continue;
+        if (body.method || (body.id !== 1 && body.id !== 2)) continue;
         if (body.error) { finish(new Error(body.error.message || "Codex request failed.")); break; }
         if (body.id === 1) {
+          stage = method;
           send({ method: "initialized", params: {} });
           send({ id: 2, method, params });
         } else { result = body.result; finish(); }

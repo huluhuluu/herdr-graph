@@ -4,7 +4,7 @@
 // and raw-key input. No dependencies -- the layout is fixed and small enough
 // that a framework would only add weight and Windows risk.
 
-const { width: strWidth, truncate, pad, charWidth } = require("./util");
+const { width: strWidth, truncate, charWidth } = require("./util");
 
 const ESC = "\x1b[";
 const RESET = `${ESC}0m`;
@@ -151,10 +151,6 @@ class Screen {
         prio: this.layer * 10 + prio,
       });
     }
-  }
-
-  hline(x, y, w, ch = "─", style) {
-    this.text(x, y, ch.repeat(Math.max(0, w)), style);
   }
 
   render() {

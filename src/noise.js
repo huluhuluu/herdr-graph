@@ -74,21 +74,6 @@ function isBracketNotice(text) {
   return BRACKET_NOTICES.some(re => re.test(t));
 }
 
-// Strip a leading wrapper block so the real prose inside survives when there is
-// any. Returns "" when the message was nothing but wrapper content.
-function stripWrappers(text, tags) {
-  let t = String(text ?? "");
-  for (let i = 0; i < 4; i++) {
-    const m = t.trimStart().match(/^<([a-zA-Z_][\w-]*)[\s>]/);
-    if (!m || !tags.includes(m[1])) break;
-    const tag = m[1];
-    const close = t.lastIndexOf(`</${tag}>`);
-    if (close === -1) return "";
-    t = t.slice(close + tag.length + 3);
-  }
-  return t.trim();
-}
-
 // Decide whether a candidate user message is real human prose.
 function isHumanText(text, kind) {
   const t = String(text ?? "").trim();
@@ -108,19 +93,4 @@ function isHumanText(text, kind) {
   return true;
 }
 
-// A short label for a node when the prompt is unavailable.
-function fallbackLabel(node) {
-  const t = node.prompt || node.reply || "";
-  return t.slice(0, 60) || `(turn ${node.index + 1})`;
-}
-
-module.exports = {
-  CODEX_WRAPPERS,
-  CLAUDE_WRAPPERS,
-  BRACKET_NOTICES,
-  hasWrapper,
-  isBracketNotice,
-  stripWrappers,
-  isHumanText,
-  fallbackLabel,
-};
+module.exports = { isBracketNotice, isHumanText };

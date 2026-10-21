@@ -693,6 +693,22 @@ test("large linear transcripts keep flat depth without overflowing the traversal
   assert.equal(nodes.at(-1).parentId, `codex:${A}#11998`);
 });
 
+test("Claude parses a long human/tool/assistant chain without recursion or losing message anchors", t => {
+  const env = fixture(t), rows = [];
+  for (let i = 0; i < 12000; i++) rows.push(
+    { type: "user", uuid: `u${i}`, parentUuid: i ? `a${i - 1}` : null, message: { content: `Question ${i}` } },
+    { type: "assistant", uuid: `tool${i}`, parentUuid: `u${i}`, message: { content: [{ type: "tool_use", id: `call${i}` }] } },
+    { type: "user", uuid: `result${i}`, parentUuid: `tool${i}`, message: { content: [{ type: "tool_result", tool_use_id: `call${i}` }] } },
+    { type: "assistant", uuid: `a${i}`, parentUuid: `result${i}`, message: { content: `Answer ${i}` } },
+  );
+  const file = write(path.join(env.CLAUDE_CONFIG_DIR, "projects/demo", `${A}.jsonl`), rows);
+  const turns = claude.parseTurns(file);
+  assert.equal(turns.length, 12000);
+  assert.equal(turns.at(-1).parentKey, "u11998");
+  assert.equal(turns.at(-1).replyFull, "Answer 11999");
+  assert.deepEqual(turns.at(-1).messageUuids, ["u11999", "tool11999", "result11999", "a11999"]);
+});
+
 test("family search selects the actual matching turn and highlights a deep full-text reply in the reader", t => {
   const env = fixture(t);
   rollout(env, A, ["intro", "main"]);
@@ -881,6 +897,108 @@ test("background loading publishes the caller before directory history and resol
   assert.equal(transcript.turns.at(-1).replyFull, "Reply nested");
   assert.ok(!messages.some(m => m.type === "error"), JSON.stringify(messages.filter(m => m.type === "error")));
   assert.equal(codex.parseTurns(file).length, 2, "browsing leaves the native transcript intact");
+  loader.send({ type: "page", id: 3, scope: "lineage", session: { agent: "codex", value: B } });
+  const lineage = (await wait(m => m.type === "page" && m.id === 3)).graph;
+  assert.equal(lineage.scope, "lineage");
+  assert.ok([...lineage.sessions.values()].every(entry => !entry.loaded), "turn lineage shares metadata-first family loading");
+});
+
+test("overlapping detail requests use parents discovered while older rows are waiting", async t => {
+  const env = fixture(t);
+  env.HERDR_PLUGIN_STATE_DIR = path.join(env.CODEX_HOME, "cache");
+  const parentFile = rollout(env, A, ["intro", "main"], { cwd: "/work/other" });
+  const childFile = rollout(env, B, ["intro", "branch"], { parent: A, ordinal: 5 });
+  const metadata = file => ({ ...codex.readMeta(file, new Map()), mtime: fs.statSync(file).mtimeMs });
+  const worker = new (require("node:worker_threads").Worker)(`
+    const { parentPort, workerData } = require("node:worker_threads");
+    const adapters = require(workerData.adapters);
+    const [child, parent] = workerData.rows;
+    const codex = adapters.byId("codex");
+    adapters.ADAPTERS.splice(0, adapters.ADAPTERS.length, codex);
+    codex.scanSessions = function* () { yield child; yield parent; };
+    require(workerData.herdr).paneList = () => [];
+    const post = parentPort.postMessage.bind(parentPort);
+    let started = false;
+    parentPort.postMessage = message => {
+      post(message);
+      if (message.type !== "catalog") return;
+      if (!started) {
+        started = true;
+        const waiting = [1, 2, 3].map(n => ({ ...child, sessionId: "wait" + n }));
+        parentPort.emit("message", { type: "details", id: 1, rows: [...waiting, child] });
+      }
+      if (message.entries.some(row => row.sessionId === parent.sessionId)) {
+        parentPort.emit("message", { type: "details", id: 1, rows: [child] });
+      }
+    };
+    require(workerData.loader);
+    parentPort.emit("message", { type: "start", id: 1, scope: "all", cwd: child.cwd });
+  `, { eval: true, env: { ...process.env, ...env }, workerData: {
+    adapters: require.resolve("../src/adapters"), herdr: require.resolve("../src/herdr"),
+    loader: require.resolve("../src/loader-worker"), rows: [metadata(childFile), metadata(parentFile)],
+  } });
+  t.after(() => worker.terminate());
+  const edges = [];
+  await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("Overlapping details did not finish")), 5000);
+    t.after(() => clearTimeout(timer));
+    worker.on("error", reject);
+    worker.on("message", message => {
+      if (message.type === "error") reject(new Error(message.error));
+      if (message.type !== "edge" || message.key !== `codex:${B}`) return;
+      edges.push(message.info);
+      if (edges.length === 2) resolve();
+    });
+  });
+  assert.equal(edges.length, 2);
+  assert.ok(edges.every(info => !info.parentUnavailable && info.number === 1));
+});
+
+test("back navigation restores native identity after background batches reorder saved history", t => {
+  const env = fixture(t);
+  rollout(env, A, ["intro"]);
+  const graph = adapters.buildGraph({ scope: "all", env, store: store() });
+  const app = appFor(graph, env);
+  app.historyView = "time";
+  app.loader = { send() {} };
+  app.backgroundMessage({ type: "catalog", entries: [...graph.sessionMeta.values()], complete: false });
+  assert.equal(app.current().sessionId, A);
+  app.scroll = 7;
+  app.handleKey({ name: "enter" });
+  const file = rollout(env, B, ["newer"]);
+  const newer = { ...codex.readMeta(file), mtime: Date.now() + 10000 };
+  app.backgroundMessage({ type: "catalog", entries: [newer], complete: true });
+  app.handleKey({ name: "backspace" });
+  assert.equal(app.nodes()[0].sessionId, B, "new history is ordered ahead of the saved selection");
+  assert.equal(app.current().sessionId, A);
+  assert.equal(app.scroll, 7);
+});
+
+test("turn lineage includes branches arriving after the page and restores them after back navigation", t => {
+  const env = fixture(t);
+  const file = rollout(env, A, ["intro", "main"]);
+  const graph = adapters.buildGraph({ scope: "all", adapter: codex, sessionId: A, env, store: store() });
+  graph.scope = "lineage";
+  const app = appFor(graph, env), sent = [];
+  app.loader = { send: message => sent.push(message) };
+  app.backgroundMessage({ type: "catalog", entries: [...graph.sessionMeta.values()], complete: false });
+  app.backgroundMessage({ type: "transcript", id: app.loadId, key: `codex:${A}`, turns: codex.parseTurns(file) });
+  app.selected = app.nodes().findIndex(row => row.key === "main");
+  const childFile = rollout(env, B, ["intro", "branch"], { parent: A, ordinal: 5 });
+  app.backgroundMessage({ type: "catalog", entries: [{ ...codex.readMeta(childFile), mtime: Date.now() }], complete: true });
+  assert.equal(app.current().key, "main");
+  assert.ok(app.nodes().some(row => row.sessionId === B && row.contentState === "loading…"));
+  app.render();
+  assert.ok(sent.some(message => message.type === "details" && message.includeTurns && message.rows.some(row => row.sessionId === B)));
+  app.backgroundMessage({ type: "transcript", id: app.loadId, key: `codex:${B}`, turns: codex.parseTurns(childFile) });
+  const branch = app.nodes().find(row => row.sessionId === B && row.sessionBoundary);
+  assert.equal(branch.forkPointId, `codex:${A}#intro`);
+  assert.equal(app.nodes().filter(row => row.key === "intro").length, 1);
+  assert.ok(app.nodes().some(row => row.key === "branch"));
+  app.selected = app.nodes().findIndex(row => row.id === branch.id);
+  app.handleKey({ name: "enter" }); app.handleKey({ name: "backspace" });
+  assert.equal(app.current().id, branch.id);
+  assert.ok(app.nodes().some(row => row.key === "branch"));
 });
 
 test("late background results cannot replace a restored page or move its selection", t => {
@@ -906,6 +1024,77 @@ test("late background results cannot replace a restored page or move its selecti
   app.backgroundMessage({ type: "catalog", entries: meta, complete: true });
   assert.equal(app.current().sessionId, B, "catalog updates preserve selection by ID");
   assert.ok(sent.some(m => m.type === "cancel"));
+});
+
+test("catalog batches merge page records instead of removing sessions discovered by an opened page", t => {
+  const env = fixture(t);
+  rollout(env, A, ["page-only"]); rollout(env, B, ["scan-result"]);
+  const graph = adapters.buildGraph({ scope: "all", env, store: store() });
+  const app = appFor(graph, env);
+  app.historyView = "time";
+  app.selected = app.nodes().findIndex(row => row.sessionId === A);
+  app.loader = { send() {} };
+  app.handleKey({ name: "enter" });
+  const other = graph.sessionMeta.get(`codex:${B}`);
+  app.backgroundMessage({ type: "catalog", entries: [other], complete: false });
+  app.handleKey({ name: "backspace" });
+  assert.deepEqual(new Set(app.nodes().map(row => row.sessionId)), new Set([A, B]));
+  assert.equal(app.current().sessionId, A);
+  app.backgroundMessage({ type: "catalog", entries: [other], complete: true });
+  assert.equal(app.nodes().length, 2);
+  assert.equal(app.graph.sessionMeta.size, 2);
+  assert.equal(app.current().sessionId, A);
+});
+
+test("a family opened before metadata scanning has a statted current session and a valid catalog row", async t => {
+  const env = fixture(t), file = rollout(env, A, ["intro"]);
+  let timer;
+  const result = await new Promise((resolve, reject) => {
+    const loader = new Loader(env, message => {
+      if (message.type === "page" || message.type === "error") { clearTimeout(timer); resolve(message); }
+    });
+    t.after(() => loader.close());
+    timer = setTimeout(() => reject(new Error("Initial family page timed out")), 10000);
+    loader.send({ type: "page", id: 1, scope: "lineage", family: true, session: { agent: "codex", value: A, file } });
+  });
+  assert.equal(result.type, "page", result.error);
+  assert.equal(result.graph.nodes.length, 1);
+  assert.ok(result.graph.sessionMeta.get(`codex:${A}`).mtime > 0);
+  assert.ok(Number.isFinite(Date.parse(result.graph.nodes[0].timestamp)));
+});
+
+test("current identity follows only the caller pane and c uses a new background page generation", t => {
+  const env = fixture(t);
+  const file = rollout(env, A, ["intro", "latest"]);
+  rollout(env, B, ["other"]);
+  const graph = adapters.buildGraph({ scope: "all", env, store: store() });
+  const app = appFor(graph, env), sent = [];
+  const pane = { pane_id: "caller", agent: "codex", agent_session: { value: A } };
+  app.callerId = "caller";
+  app.callerPane = () => pane;
+  app.backgroundMessage({ type: "caller", pane });
+  assert.equal(app.isCallerSession({ agent: "codex", sessionId: A }), true);
+  assert.equal(app.isCallerSession({ agent: "claude", sessionId: A }), false);
+  app.backgroundMessage({ type: "panes", panes: [{ ...pane, agent_session: { value: B } }, { ...pane, pane_id: "other" }] });
+  assert.equal(app.isCallerSession({ agent: "codex", sessionId: B }), true);
+  app.loader = { send: message => sent.push(message) };
+  app.handleKey({ name: "c" });
+  assert.equal(sent.at(-1).session.value, A, "explicit shortcut checks live caller identity");
+  assert.equal(sent.at(-1).scope, "session");
+  assert.equal(app.graph, null);
+  app.backgroundMessage({ type: "page", id: app.loadId - 1, scope: "all", graph });
+  assert.equal(app.graph, null);
+  app.backgroundMessage({ type: "page", id: app.loadId, scope: "session", complete: true,
+    graph: adapters.buildGraph({ adapter: codex, file, scope: "session", env, store: store() }) });
+  assert.equal(app.current().key, "latest");
+  app.backgroundMessage({ type: "panes", panes: [] });
+  assert.equal(app.isCallerSession({ agent: "codex", sessionId: A }), false);
+  app.callerPane = () => null;
+  const before = app.graph, requests = sent.length;
+  app.handleKey({ name: "c" });
+  assert.equal(app.graph, before);
+  assert.equal(sent.length, requests);
+  assert.match(app.message, /Current session ID unavailable/);
 });
 
 test("paging and focus keys agree across history, conversation, narrow terminals and input modes", t => {

@@ -14,7 +14,7 @@ function bin() {
   return process.env.HERDR_BIN_PATH || "herdr";
 }
 
-function cli(args, { timeout = 15000, json = true } = {}) {
+function cli(args, { timeout = 15000 } = {}) {
   const res = spawnSync(bin(), args, {
     encoding: "utf8",
     windowsHide: true,
@@ -22,7 +22,6 @@ function cli(args, { timeout = 15000, json = true } = {}) {
     stdio: ["ignore", "pipe", "pipe"],
   });
   const stdout = (res.stdout || "").trim();
-  if (!json) return stdout;
   let body;
   try { body = JSON.parse(stdout || (res.stderr || "").trim()); } catch {}
   if (res.error || res.status !== 0 || body?.error) {
@@ -67,8 +66,10 @@ function currentPane() {
 function targetPane() {
   const id = callerPaneId();
   if (id) {
-    const pane = paneGet(id);
-    if (pane) return pane;
+    try {
+      const pane = paneGet(id);
+      if (pane) return pane;
+    } catch {}
   }
   return currentPane();
 }

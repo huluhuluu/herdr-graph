@@ -103,7 +103,7 @@ Cleanup never deletes agent transcripts, other plugins, repository files or conf
 1. Focus an agent pane in Herdr, or open the plugin to browse saved history.
 2. Press `prefix+g`. With Herdr's default prefix, press **Ctrl+B**, release, then **G** without Shift.
 3. Press `s` for saved sessions, grouped by directory. Press `Enter` to expand a directory, then read a session. Use `a` to filter agents, `v` for a time list, `o` to reverse the sort order and `/` to search. Missing current-session IDs automatically open history.
-4. Move with `j/k`; press `Tab` to focus and scroll the content. In an ordinary conversation, `Enter` on a turn focuses its running session. `n` resumes and `F` forks; see agent-specific behavior below.
+4. Move with `j/k`; press `Tab` to focus and scroll the content. Press `c` from any browsing page to read the caller's current conversation at its latest saved turn. In an ordinary conversation, `Enter` on a turn focuses its running session. `n` resumes and `F` forks; see agent-specific behavior below.
 5. Press `R` to rename the selected session. Use **Ctrl+U** to clear the existing name, type a name and press `Enter`; `Esc` cancels.
 6. Press `f` for **Family**, then `d` to switch between session structure and detailed turns. Branches show their source `[turn N]`; select a turn to read its full question and answer. `T` toggles timestamps, `h/l` fold branches.
 7. Press `Backspace` or `Esc` to return to the previous page, keeping its selection, filters, folds and scroll position. `Esc` closes at the first page; `q` closes from any page. During search or rename, `Esc` cancels editing.
@@ -123,6 +123,7 @@ herdr plugin action invoke open --plugin huluhlu.session-graph
 | `PgUp` / `PgDn` | Page the focused tree in every view; scroll focused content by 10 lines |
 | `Enter` | Directory: expand / collapse; session header: read; Family turn: focus reader; ordinary turn: jump to running pane |
 | `s` | Show all saved sessions |
+| `c` | Open / refresh the caller's current conversation at its latest saved turn; bypass search and history filters |
 | `f` | Open the whole family under the common ancestor; repeated presses stay on that page |
 | `d` | Switch Family structure / detailed conversation tree; opens Family when used elsewhere |
 | `b` | Compatibility alias for `f` |
@@ -146,6 +147,10 @@ herdr plugin action invoke open --plugin huluhlu.session-graph
 Search selects the first actual match, highlights matching text in yellow and positions the reader at the hit. Family keeps ancestor rows for context. Press `Tab` to focus **Content**, then use `↑/↓` or `j/k` to scroll, `PgUp/PgDn` to page and `Home/End` for top/bottom. Focus changes preserve your position; `Ctrl+U` clears search or rename input.
 
 History expands the caller's directory initially. `v` switches to a flat time list; `o` reverses transcript modification-time sorting. Agent filters combine with search and sorting. Dates are displayed in UTC.
+
+Session totals deduplicate native IDs within each agent and include archived Codex records. Scan batches merge with sessions already discovered by opened pages. An unreadable session remains listed with its read error and does not stop other files from being scanned; an unavailable Codex title index falls back to transcript metadata.
+
+`[current]` marks the current session of the agent pane that opened the plugin, even while browsing another session. It appears on graph nodes rather than the header or footer: conversation and history rows show it in green beside the purple branch/fork badges, retaining its color on the selected row. Filled dots identify its turns. Press `c` to read or refresh its saved history, and `Backspace` to return to the previous page. Native identity from Herdr's `agent_session.value` takes priority. Without it, each catalog batch checks for a unique exact match of agent, directory and full terminal session title, so the marker can appear while scanning continues. A later ambiguous match removes the marker. If identity remains unavailable or ambiguous, `c` explains the problem and keeps the page open.
 
 ### Family and branches
 

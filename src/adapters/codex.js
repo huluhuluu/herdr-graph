@@ -56,9 +56,13 @@ function sessionNames(env = process.env) {
   env = sessionEnv(env);
   const names = new Map();
   const file = path.join(env.CODEX_HOME || path.join(homeDir(env), ".codex"), "session_index.jsonl");
-  if (fs.existsSync(file)) eachRecord(file, o => {
-    if (o.id && typeof o.thread_name === "string") names.set(o.id, o.thread_name);
-  });
+  try {
+    eachRecord(file, o => {
+      if (o.id && typeof o.thread_name === "string") names.set(o.id, o.thread_name);
+    });
+  } catch {
+    // Missing/unreadable title indexes must not hide readable session files.
+  }
   return names;
 }
 
@@ -70,7 +74,7 @@ function readMeta(file, names = null, env = process.env) {
     if (!line.trim()) continue;
     let o;
     try { o = JSON.parse(line); } catch { continue; }
-    if (o.type === "session_meta" && o.payload) { meta = o.payload; break; }
+    if (o?.type === "session_meta" && o.payload) { meta = o.payload; break; }
   }
   if (!meta) return null;
   const fileId = sessionIdFromFile(file);
@@ -123,7 +127,7 @@ function eachRecord(file, fn) {
         if (line.trim()) {
           let o;
           try { o = JSON.parse(line); } catch { continue; }
-          fn(o, lineNo);
+          if (o && typeof o === "object" && !Array.isArray(o)) fn(o, lineNo);
         }
       }
       // Guard against a pathological single line.
@@ -134,7 +138,7 @@ function eachRecord(file, fn) {
       lineNo++;
       let o;
       try { o = JSON.parse(carry); } catch { o = null; }
-      if (o) fn(o, lineNo);
+      if (o && typeof o === "object" && !Array.isArray(o)) fn(o, lineNo);
     }
   } finally {
     fs.closeSync(fd);
@@ -270,11 +274,18 @@ function dedupe(list) {
 function* scanSessions(env = process.env) {
   const names = sessionNames(env);
   for (const file of listSessionFiles(env)) {
+    const sessionId = sessionIdFromFile(file);
+    if (!sessionId) continue;
     const st = safeStat(file);
     if (!st) continue;
-    const meta = readMeta(file, names);
-    if (!meta) continue;
-    yield { ...meta, mtime: st.mtimeMs, size: st.size };
+    try {
+      const meta = readMeta(file, names);
+      if (!meta) throw new Error("Session metadata is missing or incomplete.");
+      yield { ...meta, mtime: st.mtimeMs, size: st.size };
+    } catch (error) {
+      yield { agent: AGENT, sessionId, file, cwd: "", title: names.get(sessionId) || sessionId.slice(0, 8),
+        mtime: st.mtimeMs, size: st.size, readError: error.message };
+    }
   }
 }
 

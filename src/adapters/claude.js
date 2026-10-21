@@ -62,11 +62,6 @@ function blocksToText(content) {
   return parts.join("\n");
 }
 
-function hasToolResultOnly(content) {
-  if (!Array.isArray(content) || !content.length) return false;
-  return content.every(b => b && (b.type === "tool_result" || b.type === "tool_use"));
-}
-
 function readMeta(file) {
   const head = readHead(file, 64 * 1024);
   let first = null;
@@ -81,6 +76,7 @@ function readMeta(file) {
     if (!line.trim()) continue;
     let o;
     try { o = JSON.parse(line); } catch { continue; }
+    if (!o || typeof o !== "object" || Array.isArray(o)) continue;
     if (!first) first = o;
     if (!forkedFrom && o.forkedFrom && typeof o.forkedFrom === "object") forkedFrom = o.forkedFrom;
     if (!cwd && o.cwd) cwd = o.cwd;
@@ -142,17 +138,7 @@ function parseTurns(file) {
     // the next human message's parentUuid points at it, so
     // nearestHumanAncestor walks straight past to the previous real turn.
     if (r.isCompactSummary === true) return false;
-    const msg = r.message || {};
-    if (hasToolResultOnly(msg.content)) return false;
-    const text = blocksToText(msg.content).trim();
-    if (!text) return false;
-    return isHumanText(text, AGENT);
-  }
-
-  function textOf(r) {
-    if (r.type === "user") return blocksToText((r.message || {}).content);
-    if (r.type === "assistant") return blocksToText((r.message || {}).content);
-    return "";
+    return isHumanText(blocksToText(r.message?.content), AGENT);
   }
 
   // Resolve the effective parent, following compact_boundary redirection.
@@ -165,6 +151,7 @@ function parseTurns(file) {
 
   const humans = records.filter(isHuman);
   if (!humans.length) return [];
+  const humanIds = new Set(humans.map(r => r.uuid));
 
   // Child map over human nodes: the nearest human ancestor of each human.
   function nearestHumanAncestor(r) {
@@ -174,7 +161,7 @@ function parseTurns(file) {
       guard.add(cur);
       const p = byUuid.get(cur);
       if (!p) return null;
-      if (isHuman(p)) return p.uuid;
+      if (humanIds.has(cur)) return cur;
       cur = parentOf(p);
     }
     return null;
@@ -189,19 +176,6 @@ function parseTurns(file) {
     childrenOf.get(pa).push(h.uuid);
   }
 
-  // Merge every assistant record reachable from a human node without crossing
-  // into another human node.
-  function replyFor(uuid) {
-    const texts = [];
-    for (const r of descendantsUntilHuman(uuid)) {
-      if (r.type === "assistant") {
-        const t = textOf(r).trim();
-        if (t) texts.push(t);
-      }
-    }
-    return dedupe(texts).join("\n\n").trim();
-  }
-
   function descendantsUntilHuman(startUuid) {
     const out = [];
     const seen = new Set();
@@ -212,7 +186,7 @@ function parseTurns(file) {
       seen.add(id);
       const r = byUuid.get(id);
       if (!r) continue;
-      if (isHuman(r)) continue; // stop at the next turn
+      if (humanIds.has(id)) continue; // stop at the next turn
       out.push(r);
       for (const c of childrenOfRaw.get(id) || []) stack.push(c);
     }
@@ -236,35 +210,39 @@ function parseTurns(file) {
 
   const turns = [];
   const visited = new Set();
-  function walk(uuid, depth) {
-    if (visited.has(uuid)) return;
-    visited.add(uuid);
-    const r = byUuid.get(uuid);
-    const prompt = textOf(r).trim();
-    const reply = replyFor(uuid);
-    turns.push({
-      agent: AGENT,
-      key: uuid,
-      depth,
-      parentKey: parentOfHuman.get(uuid) || null,
-      messageUuids: [uuid, ...descendantsUntilHuman(uuid).map(record => record.uuid)],
-      timestamp: r.timestamp || null,
-      prompt: oneLine(prompt),
-      reply: oneLine(reply),
-      promptFull: prompt,
-      replyFull: reply,
-      branchCount: (childrenOf.get(uuid) || []).length,
-    });
-    const kids = (childrenOf.get(uuid) || [])
-      .map(id => byUuid.get(id))
-      .filter(Boolean)
-      .sort((a, b) => String(a.timestamp).localeCompare(String(b.timestamp)));
-    for (const k of kids) walk(k.uuid, depth + 1);
+  function walk(start) {
+    const stack = [{ uuid: start, depth: 0 }];
+    while (stack.length) {
+      const { uuid, depth } = stack.pop();
+      if (visited.has(uuid)) continue;
+      visited.add(uuid);
+      const r = byUuid.get(uuid);
+      const prompt = blocksToText(r.message?.content).trim();
+      const descendants = descendantsUntilHuman(uuid);
+      const reply = dedupe(descendants.filter(record => record.type === "assistant")
+        .map(record => blocksToText(record.message?.content).trim())).join("\n\n").trim();
+      turns.push({
+        agent: AGENT,
+        key: uuid,
+        depth,
+        parentKey: parentOfHuman.get(uuid) || null,
+        messageUuids: [uuid, ...descendants.map(record => record.uuid)],
+        timestamp: r.timestamp || null,
+        prompt: oneLine(prompt),
+        reply: oneLine(reply),
+        promptFull: prompt,
+        replyFull: reply,
+        branchCount: (childrenOf.get(uuid) || []).length,
+      });
+      const kids = (childrenOf.get(uuid) || []).sort((a, b) =>
+        String(byUuid.get(a).timestamp).localeCompare(String(byUuid.get(b).timestamp)));
+      for (let i = kids.length - 1; i >= 0; i--) stack.push({ uuid: kids[i], depth: depth + 1 });
+    }
   }
 
-  for (const r of roots) walk(r.uuid, 0);
+  for (const r of roots) walk(r.uuid);
   // Any human node orphaned by a missing ancestor still belongs in the graph.
-  for (const h of humans) if (!visited.has(h.uuid)) walk(h.uuid, 0);
+  for (const h of humans) if (!visited.has(h.uuid)) walk(h.uuid);
 
   // Reindex after DFS ordering.
   turns.forEach((t, i) => { t.index = i; });
@@ -287,9 +265,14 @@ function* scanSessions(env = process.env) {
   for (const file of listSessionFiles(env)) {
     const st = safeStat(file);
     if (!st) continue;
-    const meta = readMeta(file);
-    if (!meta) continue;
-    yield { ...meta, mtime: st.mtimeMs, size: st.size };
+    try {
+      const meta = readMeta(file);
+      if (meta) yield { ...meta, mtime: st.mtimeMs, size: st.size };
+    } catch (error) {
+      const sessionId = sessionIdFromFile(file);
+      yield { agent: AGENT, sessionId, file, cwd: "", title: sessionId.slice(0, 8),
+        mtime: st.mtimeMs, size: st.size, readError: error.message };
+    }
   }
 }
 
@@ -305,7 +288,6 @@ module.exports = {
   sessionIdFromFile,
   readMeta,
   parseTurns,
-  eachRecord,
   listSessions,
   scanSessions,
 };

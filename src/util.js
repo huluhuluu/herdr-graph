@@ -73,10 +73,10 @@ function wrap(text, max) {
 }
 
 // --- filesystem ----------------------------------------------------------
-function walkJsonl(root, limit = 20000) {
+function walkJsonl(root) {
   const out = [];
   const stack = [root];
-  while (stack.length && out.length < limit) {
+  while (stack.length) {
     const dir = stack.pop();
     let ents;
     try { ents = fs.readdirSync(dir, { withFileTypes: true }); } catch { continue; }
@@ -94,10 +94,24 @@ function readHead(file, lines = 1) {
   try {
     fd = fs.openSync(file, "r");
     const buf = Buffer.alloc(1024 * 256);
-    const n = fs.readSync(fd, buf, 0, buf.length, 0);
-    return buf.subarray(0, n).toString("utf8").split("\n").slice(0, lines);
-  } catch {
-    return [];
+    const chunks = [];
+    let bytes = 0;
+    for (;;) {
+      const n = fs.readSync(fd, buf, 0, buf.length, null);
+      if (!n) break;
+      // Finish an oversized first record; do not follow later tool-output records.
+      const newline = buf.subarray(0, n).indexOf(10);
+      const chunk = Buffer.from(buf.subarray(0, chunks.length && newline >= 0 ? newline + 1 : n));
+      chunks.push(chunk);
+      bytes += chunk.length;
+      if (bytes > 64 * 1024 * 1024) throw new Error("Session header record exceeds 64 MiB.");
+      if (newline >= 0) break;
+    }
+    const head = chunks.length === 1 ? chunks[0] : Buffer.concat(chunks);
+    return head.toString("utf8").split("\n").slice(0, lines);
+  } catch (error) {
+    if (error.code === "ENOENT") return [];
+    throw error;
   } finally {
     if (fd !== undefined) try { fs.closeSync(fd); } catch {}
   }

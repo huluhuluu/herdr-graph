@@ -3,8 +3,6 @@
 // Adapter registry plus the graph builder that stitches turns and cross-session
 // lineage into a renderable tree.
 
-const fs = require("node:fs");
-const path = require("node:path");
 const codex = require("./codex");
 const claude = require("./claude");
 const dst = require("./dst");
@@ -24,15 +22,6 @@ function forAgent(agent) {
   if (a === "claude" || a === "claude-code") return claude;
   if (a === "dst" || a.startsWith("dsh") || a === "deepseek") return dst;
   return ADAPTERS.find(x => a.startsWith(x.id)) || null;
-}
-
-function detect() {
-  const found = [];
-  for (const a of ADAPTERS) {
-    const roots = a.sessionRoots();
-    if (roots.some(r => fs.existsSync(r))) found.push(a);
-  }
-  return found;
 }
 
 // Locate a session file by native session id, across every adapter.
@@ -124,21 +113,19 @@ function buildGraph({ adapter, sessionId, file, scope = "session", env = process
   // Index every session on disk once; lineage walks are then pure lookups.
   // Default view reads family metadata but never parses sibling transcripts.
   let index = null;
+  const children = new Map();
   function ensureIndex() {
     if (index) return index;
     index = new Map();
     for (const entry of entries || listSessions(env, adapterList)) index.set(entry.key, { adapter: entry.adapter, meta: entry });
     if (!index.has(rootEntry.key)) index.set(rootEntry.key, { adapter: found.adapter, meta: { ...rootEntry.meta, sessionId: rootEntry.sessionId, file: rootEntry.file } });
-    return index;
-  }
-
-  function childrenOf(key) {
-    const [agent, sid] = key.split(":");
-    const out = [];
-    for (const v of ensureIndex().values()) {
-      if (v.adapter.id === agent && v.meta.parentSessionId === sid) out.push(v);
+    for (const entry of index.values()) {
+      if (!entry.meta.parentSessionId) continue;
+      const key = `${entry.adapter.id}:${entry.meta.parentSessionId}`;
+      if (!children.has(key)) children.set(key, []);
+      children.get(key).push(entry);
     }
-    return out;
+    return index;
   }
 
   if (scope !== "session") {
@@ -159,9 +146,8 @@ function buildGraph({ adapter, sessionId, file, scope = "session", env = process
     // Walk down through every descendant.
     const queue = [cur.key];
     const guard = new Set(queue);
-    while (queue.length) {
-      const key = queue.shift();
-      for (const c of childrenOf(key)) {
+    for (let i = 0; i < queue.length; i++) {
+      for (const c of children.get(queue[i]) || []) {
         const ckey = `${c.adapter.id}:${c.meta.sessionId}`;
         if (guard.has(ckey)) continue;
         guard.add(ckey);
@@ -312,4 +298,4 @@ function flatten(sessions, rootEntry, scope, metadata = null) {
   return nodes;
 }
 
-module.exports = { ADAPTERS, byId, forAgent, detect, findSession, listSessions, buildGraph, flatten, sharedPrefix, forkInfo };
+module.exports = { ADAPTERS, byId, forAgent, findSession, listSessions, buildGraph, flatten, sharedPrefix, forkInfo };

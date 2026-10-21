@@ -6,6 +6,7 @@ const { makeStore, cachedParse } = require("./store");
 const { edgeInfo } = require("./relations");
 const { directoryKey } = require("./catalog");
 const herdr = require("./herdr");
+const { safeStat } = require("./util");
 
 const store = makeStore(), entries = new Map(), renamed = new Map();
 let pageId = 0, scanning = false, complete = false, flushTimer;
@@ -13,6 +14,11 @@ const yieldIO = () => new Promise(resolve => setImmediate(resolve));
 const send = message => parentPort.postMessage(message);
 const list = () => [...entries.values()].sort((a, b) => b.mtime - a.mtime);
 function remember(meta, adapter) {
+  if (meta.mtime == null) {
+    const st = safeStat(meta.file);
+    if (!st) return;
+    meta = { ...meta, mtime: st.mtimeMs, size: st.size };
+  }
   const key = `${adapter.id}:${meta.sessionId}`, old = entries.get(key);
   if (renamed.has(key)) meta = { ...meta, title: renamed.get(key) };
   if (!old || (meta.mtime || 0) >= (old.mtime || 0)) entries.set(key, { ...meta, key, agent: adapter.id, adapter });
@@ -65,7 +71,6 @@ async function scan(cwd, agent) {
 
 async function details(id, rows, includeTurns = false) {
   const turns = new Map(), errors = new Map();
-  const records = new Map(list().map(entry => [entry.key, entry]));
   const get = meta => {
     const key = `${meta.agent}:${meta.sessionId}`;
     if (turns.has(key)) return turns.get(key);
@@ -74,15 +79,16 @@ async function details(id, rows, includeTurns = false) {
       turns.set(key, value); return value;
     } catch (error) { errors.set(key, error.message); turns.set(key, null); return null; }
   };
-  for (const row of rows) {
+  for (const requested of rows) {
     await yieldIO();
     if (id !== pageId) return;
-    const parent = records.get(`${row.agent}:${row.parentSessionId}`);
+    const row = entries.get(`${requested.agent}:${requested.sessionId}`) || requested;
+    const parent = entries.get(`${row.agent}:${row.parentSessionId}`);
     if (!row.missing) get(row);
     if (parent) get(parent);
     if (includeTurns) send({ type: "transcript", id, key: `${row.agent}:${row.sessionId}`,
       turns: turns.get(`${row.agent}:${row.sessionId}`) || [], error: errors.get(`${row.agent}:${row.sessionId}`) });
-    const info = edgeInfo(row, records, meta => turns.get(`${meta.agent}:${meta.sessionId}`) ?? null);
+    const info = edgeInfo(row, entries, meta => turns.get(`${meta.agent}:${meta.sessionId}`) ?? null);
     const error = errors.get(`${row.agent}:${row.sessionId}`) || errors.get(`${row.agent}:${row.parentSessionId}`);
     if (error) { info.error = error; info.pending = false; }
     // The sidebar needs a prompt and timestamp, not full copies of every reply.
@@ -104,8 +110,8 @@ async function page(message) {
     if (meta) remember(meta, adapter);
   }
   const graph = adapters.buildGraph({ adapter, sessionId: session?.value, file,
-    scope: family ? "all" : scope, entries: list(), store });
-  if (family) graph.scope = "lineage";
+    scope: family || scope === "lineage" ? "all" : scope, entries: list(), store });
+  if (family || scope === "lineage") graph.scope = "lineage";
   send({ type: "page", id, graph: portable(graph), scope: family ? "lineage" : scope, complete });
   await yieldIO();
   flushLater();

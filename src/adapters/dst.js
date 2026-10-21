@@ -81,7 +81,10 @@ function records(batch, compressed) {
   const text = (compressed ? zlib.zstdDecompressSync(batch) : batch).toString("utf8");
   return text.split("\n").flatMap(line => {
     if (!line.trim()) return [];
-    try { return [JSON.parse(line)]; } catch { return []; }
+    try {
+      const row = JSON.parse(line);
+      return row && typeof row === "object" && !Array.isArray(row) ? [row] : [];
+    } catch { return []; }
   });
 }
 

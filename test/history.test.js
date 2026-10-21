@@ -6,6 +6,7 @@ const os = require("node:os");
 const path = require("node:path");
 const zlib = require("node:zlib");
 const { EventEmitter } = require("node:events");
+const { PassThrough } = require("node:stream");
 const { App } = require("../src/graph");
 const adapters = require("../src/adapters");
 const codex = require("../src/adapters/codex");
@@ -81,6 +82,68 @@ test("history includes unrelated and archived Codex sessions without parsing the
   assert.equal(parses, 0);
 });
 
+test("catalogs retain Codex and Claude sessions whose first metadata record exceeds 256 KiB", t => {
+  const { env } = fixture(t), large = "x".repeat(300 * 1024) + "中文🙂";
+  const codexFile = write(path.join(env.CODEX_HOME, "sessions", `rollout-${A}.jsonl`), [
+    { type: "session_meta", payload: { id: A, cwd: "/work/large-codex", base_instructions: { text: large } } },
+  ]);
+  write(path.join(env.CLAUDE_CONFIG_DIR, "projects/demo", `${B}.jsonl`), [
+    { type: "system", sessionId: B, cwd: "/work/large-claude", content: large },
+  ]);
+  const records = adapters.listSessions(env);
+  assert.equal(records.length, 2);
+  assert.equal(records.find(meta => meta.agent === "codex").cwd, "/work/large-codex");
+  assert.equal(records.find(meta => meta.agent === "claude").cwd, "/work/large-claude");
+  const lines = require("../src/util").readHead(codexFile);
+  assert.equal(JSON.parse(lines[0]).payload.base_instructions.text, large);
+  const regular = rollout(env, C);
+  fs.appendFileSync(regular, JSON.stringify({ type: "tool_output", content: "x".repeat(1024 * 1024) }) + "\n");
+  assert.ok(require("../src/util").readHead(regular, 8192).join("\n").length < 512 * 1024,
+    "a complete small header must not cause metadata scans to read a large following tool output");
+});
+
+test("one unreadable session cannot abort the rest of an agent catalog", t => {
+  const { env } = fixture(t);
+  for (const id of [A, B]) {
+    rollout(env, id);
+    write(path.join(env.CLAUDE_CONFIG_DIR, "projects/demo", `${id}.jsonl`), [
+      { type: "user", uuid: id, cwd: "/work/claude", message: { content: "Readable session" } },
+    ]);
+    write(path.join(env.DSH_HOME, "sessions/demo", id, "session.v4.jsonl"), [
+      { type: "session", id, version: 4, cwd: "/work/dst" },
+    ]);
+  }
+  const open = fs.openSync;
+  for (const adapter of adapters.ADAPTERS) {
+    const [bad, good] = adapter.listSessionFiles(env);
+    fs.openSync = function (file, ...args) {
+      if (file === bad) throw Object.assign(new Error("isolated read denied"), { code: "EACCES" });
+      return open.call(this, file, ...args);
+    };
+    try {
+      const records = adapter.listSessions(env);
+      assert.equal(records.length, 2, adapter.id);
+      assert.match(records.find(meta => meta.file === bad).readError, /isolated read denied/);
+      assert.ok(records.find(meta => meta.file === good && !meta.readError));
+    } finally { fs.openSync = open; }
+  }
+});
+
+test("invalid title-index records and unreadable title indexes do not hide Codex sessions", t => {
+  const { env } = fixture(t);
+  rollout(env, A);
+  const index = path.join(env.CODEX_HOME, "session_index.jsonl");
+  write(index, [null, [], 1, { id: A, thread_name: "Readable native title" }]);
+  assert.equal(codex.listSessions(env)[0].title, "Readable native title");
+  const open = fs.openSync;
+  fs.openSync = function (file, ...args) {
+    if (file === index) throw Object.assign(new Error("title index busy"), { code: "EBUSY" });
+    return open.call(this, file, ...args);
+  };
+  try { assert.equal(codex.listSessions(env).length, 1); }
+  finally { fs.openSync = open; }
+});
+
 test("missing or unknown pane session id falls back to browsable, searchable history", t => {
   const { env } = fixture(t);
   rollout(env, A, { cwd: "project-alpha", prompt: "Fix alpha history" });
@@ -112,6 +175,163 @@ test("lineage renders ancestor turns when opened from a child session", t => {
   assert.deepEqual(new Set(graph.nodes.map(n => n.sessionId)), new Set([A, B]));
   assert.equal(graph.nodes[0].sessionId, A);
   assert.equal(graph.focusSessionId, B);
+});
+
+test("current-session markers and c follow the caller for Codex, Claude Code and DST", t => {
+  for (const [agent, reported] of [["codex", "codex"], ["claude", "claude-code"], ["dst", "dsh-tui"]]) {
+    const { env } = fixture(t);
+    for (const id of [A, B]) {
+      if (agent === "codex") rollout(env, id);
+      else if (agent === "claude") write(path.join(env.CLAUDE_CONFIG_DIR, "projects/demo", `${id}.jsonl`), [
+        { type: "user", uuid: `u-${id}`, sessionId: id, message: { content: `Question ${id}` } },
+        { type: "assistant", uuid: `a-${id}`, parentUuid: `u-${id}`, message: { content: "Answer" } },
+      ]);
+      else write(path.join(env.DSH_HOME, "sessions/demo", id, "session.v4.jsonl"), [
+        { type: "session", id, version: 4, createdAt: 1000 },
+        { seq: 0, time: 1001, type: "user/message", data: { source: { kind: "user" }, content: `Question ${id}` } },
+      ]);
+    }
+    const pane = { pane_id: "caller", agent: reported, agent_status: "busy", agent_session: { value: A } };
+    const app = appFor(env, pane);
+    app.openHistory();
+    app.selected = app.nodes().findIndex(node => node.sessionId === B);
+    app.handleKey({ name: "enter" });
+    assert.equal(app.graph.focusSessionId, B);
+    app.render();
+    assert.ok(!app.screen.buffer[0].some(item => item.text.includes("[current]")), "browsing another session does not make it current");
+    app.openHistory();
+    app.render();
+    for (const id of [A, B]) {
+      const index = app.nodes().findIndex(node => node.sessionId === id);
+      const row = app.screen.buffer[app.layout().graph.y + index];
+      assert.equal(row.some(item => item.text.includes("[current]")), id === A);
+    }
+    const family = app.relationLines(app.nodes(), B, 90);
+    assert.ok(family.find(row => row.id.includes(A)).text.includes("[current]"));
+    assert.ok(!family.find(row => row.id.includes(B)).text.includes("[current]"));
+    app.search = B; app.selected = 0;
+    app.focus = "detail"; app.scroll = 7;
+    app.handleKey({ name: "c" });
+    assert.equal(app.scope, "session");
+    assert.equal(app.graph.focusAgent, agent);
+    assert.equal(app.current().sessionId, A);
+    assert.equal(app.search, null);
+    app.render();
+    assert.ok(!app.screen.buffer[0].some(item => item.text.includes("[current]")), "current belongs on graph nodes, not the header");
+    assert.ok(app.screen.buffer[app.layout().graph.y].some(item => item.text === "[current]" && item.style.fg === "green"));
+    const depth = app.navigationStack.length;
+    app.handleKey({ name: "c" });
+    assert.equal(app.navigationStack.length, depth, "refreshing current conversation adds no navigation entry");
+    app.handleKey({ name: "backspace" });
+    assert.equal(app.scope, "all");
+    assert.equal(app.search, B);
+    assert.equal(app.focus, "detail");
+    assert.equal(app.scroll, 7);
+  }
+});
+
+test("current graph marker resolves an exact unique pane title when Herdr omits session identity", t => {
+  const { env } = fixture(t);
+  rollout(env, A, { cwd: "D:/Code/session-graph" });
+  rollout(env, B, { cwd: "D:/Code/session-graph" });
+  write(path.join(env.CODEX_HOME, "session_index.jsonl"), [
+    { id: A, thread_name: "审查代码并评估项目功能" }, { id: B, thread_name: "Other session" },
+  ]);
+  const pane = { pane_id: "caller", agent: "codex", cwd: "d:\\code\\session-graph",
+    terminal_title_stripped: "审查代码并评估项目功能 | session-graph" };
+  const app = appFor(env, pane);
+  assert.equal(app.initialSession.value, A);
+  app.updateCaller({ ...pane, terminal_title_stripped: `[ . ] Action Required | ${pane.terminal_title_stripped}` });
+  assert.equal(app.initialSession.value, A, "native status decorations do not change current session identity");
+  app.render();
+  const row = app.screen.buffer[app.layout().graph.y + app.nodes().findIndex(node => node.sessionId === A)];
+  assert.ok(row.some(item => item.text === "[current]" && item.style.fg === "green"));
+  assert.ok(!app.screen.buffer[0].some(item => item.text.includes("[current]")));
+  assert.ok(!app.screen.buffer[app.screen.height - 2].some(item => item.text.includes("current")));
+  app.handleKey({ name: "c" });
+  assert.equal(app.current().sessionId, A);
+  const meta = app.graph.sessionMeta.get(`codex:${B}`);
+  meta.title = pane.terminal_title_stripped;
+  app.updateCaller(pane);
+  assert.equal(app.initialSession, null, "literal and directory-suffixed titles must not create an ambiguous match");
+  meta.title = "审查代码并评估项目功能";
+  app.updateCaller(pane);
+  assert.equal(app.initialSession, null, "duplicate titles cannot select a current session");
+  app.updateCaller({ ...pane, agent_session: { agent: "codex", value: B } });
+  assert.equal(app.initialSession.value, B, "native identity always takes precedence");
+  app.updateCaller({ ...pane, cwd: "D:/Code/other" });
+  assert.equal(app.initialSession, null, "title alone cannot identify a pane's session");
+
+  const background = appFor(env, pane);
+  const entries = [...background.graph.sessionMeta.values()];
+  background.loader = { send() {} };
+  background.backgroundMessage({ type: "caller", pane });
+  background.backgroundMessage({ type: "catalog", entries: [entries.find(meta => meta.sessionId === A)], complete: false });
+  assert.equal(background.initialSession.value, A, "the first matching batch identifies current before scanning finishes");
+  background.render();
+  const currentRow = background.screen.buffer[background.layout().graph.y + background.nodes().findIndex(node => node.sessionId === A)];
+  assert.ok(currentRow.some(item => item.text === "[current]" && item.style.fg === "green"));
+  assert.ok(background.scanStatus, "the marker is visible while the loading indicator remains active");
+  const other = entries.find(meta => meta.sessionId === B);
+  background.backgroundMessage({ type: "catalog", entries: [{ ...other, title: "审查代码并评估项目功能" }], complete: false });
+  assert.equal(background.initialSession, null, "a later duplicate revokes the marker before scanning finishes");
+  background.backgroundMessage({ type: "catalog", entries: [other], complete: true });
+  assert.equal(background.initialSession.value, A);
+});
+
+test("renaming a title-resolved current session retains its marker without accepting changed or ambiguous panes", async t => {
+  const { env } = fixture(t);
+  rollout(env, A, { cwd: "D:/Code/demo", prompt: "Old title" });
+  rollout(env, B, { cwd: "D:/Code/demo", prompt: "Other session" });
+  let pane = { pane_id: "caller", agent: "codex", cwd: "D:/Code/demo", terminal_title_stripped: "Old title | demo" };
+  const app = appFor(env, pane, { renameSession: async () => "New title" });
+  app.callerId = pane.pane_id;
+  app.callerPane = () => pane;
+  const entries = [...app.graph.sessionMeta.values()];
+  app.loader = { send() {} };
+  app.catalog = new Map(entries.map(meta => [`${meta.agent}:${meta.sessionId}`, meta]));
+  app.selected = app.nodes().findIndex(node => node.sessionId === A);
+  app.beginRename();
+  await app.saveRename();
+  app.backgroundMessage({ type: "panes", panes: [pane] });
+  assert.equal(app.initialSession.value, A);
+  assert.ok(app.isCallerSession(app.current()));
+  pane = { ...pane, terminal_title_stripped: `[ . ] Action Required | ${pane.terminal_title_stripped}` };
+  app.backgroundMessage({ type: "panes", panes: [pane] });
+  app.openCurrentSession();
+  assert.deepEqual(app.activeSession, { agent: "codex", value: A });
+  assert.equal(app.scope, "session");
+  app.updateCaller({ ...pane, terminal_title_stripped: "Other session | demo" });
+  assert.equal(app.initialSession.value, B, "a new title resolves the new session");
+  app.updateCaller({ ...pane, agent_session: { value: A } });
+  assert.equal(app.initialSession.value, A, "native identity wins");
+  app.catalog.get(`codex:${B}`).title = "Old title";
+  app.updateCaller(pane);
+  assert.equal(app.initialSession, null, "renamed identity cannot override ambiguous title evidence");
+  app.updateCaller({ ...pane, agent_session: { value: A } });
+  app.updateCaller({ ...pane, pane_id: "another" });
+  assert.equal(app.initialSession.value, B, "another pane cannot inherit the renamed identity");
+  app.updateCaller({ ...pane, cwd: "D:/Code/other" });
+  assert.equal(app.initialSession, null);
+});
+
+test("c reloads the latest saved turn and does not intercept search or rename input", t => {
+  const { env } = fixture(t), file = rollout(env, A);
+  const app = appFor(env, { agent: "codex", agent_session: { value: A } });
+  fs.appendFileSync(file, [
+    { type: "task_started", turn_id: "latest" }, { type: "user_message", message: "Latest saved question" },
+  ].map(payload => JSON.stringify({ type: "event_msg", payload })).join("\n") + "\n");
+  app.handleKey({ name: "c" });
+  assert.equal(app.current().promptFull, "Latest saved question");
+  assert.equal(app.navigationStack.length, 0);
+  app.handleKey({ name: "/" });
+  app.handleKey({ name: "c", printable: true, raw: "c" });
+  assert.equal(app.searchInput, "c");
+  app.handleKey({ name: "escape" });
+  app.handleKey({ name: "R" });
+  const name = app.renameInput;
+  app.handleKey({ name: "c", printable: true, raw: "c" });
+  assert.equal(app.renameInput, name + "c");
 });
 
 test("installer remembers non-default agent roots for a Herdr server started without those variables", t => {
@@ -411,6 +631,48 @@ test("Codex rename uses only the native metadata method; invalid titles do not d
   await assert.rejects(native.renameSession({ agent: "codex", sessionId: A }, " ", { request }), /empty/);
   assert.equal(calls.length, 1);
   await assert.rejects(native.renameSession({ agent: "unknown", sessionId: A }, "name"), /not supported/);
+});
+
+function appServerProcess(autoClose = true) {
+  const child = new EventEmitter(), requests = [];
+  for (const name of ["stdin", "stdout", "stderr"]) child[name] = new PassThrough();
+  child.stdin.on("data", chunk => requests.push(JSON.parse(chunk)));
+  child.kill = () => { child.killed = true; if (autoClose) queueMicrotask(() => child.emit("close")); };
+  const reply = body => child.stdout.write(JSON.stringify(body) + "\n");
+  return { child, requests, reply, spawnChild: () => child };
+}
+
+test("Codex transport handles split responses and notifications, submits once and waits for process close", async () => {
+  const server = appServerProcess(false);
+  const pending = native.codexRequest("thread/fork", { threadId: A }, { ...server, binary: "stub" });
+  const init = JSON.stringify({ id: 1, result: {} }) + "\n";
+  server.child.stdout.write(init.slice(0, 5)); server.child.stdout.write(init.slice(5));
+  server.reply({ id: 1, method: "notification", params: {} });
+  assert.deepEqual(server.requests.map(request => request.method), ["initialize", "initialized", "thread/fork"]);
+  server.reply({ id: 2, result: { thread: { id: B } } });
+  assert.equal(server.child.killed, true);
+  let settled = false;
+  pending.then(() => { settled = true; });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(settled, false, "a saved fork is not used before the helper closes");
+  server.child.emit("close");
+  assert.deepEqual(await pending, { thread: { id: B } });
+});
+
+test("Codex transport reports timeout stage and stderr without retrying a submitted fork", async () => {
+  for (const initialized of [false, true]) {
+    const server = appServerProcess();
+    const pending = native.codexRequest("thread/fork", { threadId: A }, { ...server, binary: "stub", timeout: 20 });
+    server.child.stderr.write("backend diagnostic");
+    if (initialized) server.reply({ id: 1, result: {} });
+    await assert.rejects(pending, error => {
+      assert.match(error.message, initialized ? /during thread\/fork/ : /during initialize/);
+      assert.match(error.message, /backend diagnostic/);
+      return true;
+    });
+    assert.equal(server.requests.filter(request => request.method === "thread/fork").length, Number(initialized));
+    assert.equal(server.child.killed, true);
+  }
 });
 
 const hasZstd = typeof zlib.zstdCompressSync === "function";

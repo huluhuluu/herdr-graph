@@ -7,9 +7,49 @@ const os = require("node:os");
 const path = require("node:path");
 
 const { mergeConfig, removeBlock, BEGIN, END } = require("../src/install");
-const { width, truncate, pad, oneLine, wrap } = require("../src/util");
+const { width, truncate, pad, oneLine, wrap, walkJsonl } = require("../src/util");
 const { parseKeys, Screen, matchRanges, wrapMatches } = require("../src/ui");
 const { isHumanText, isBracketNotice } = require("../src/noise");
+
+test("overlay target falls back from stale pane IDs and preserves a healthy caller", () => {
+  const script = `
+    const assert = require("node:assert/strict");
+    const cp = require("node:child_process");
+    let mode, calls;
+    cp.spawnSync = (_bin, args) => {
+      calls.push(args);
+      if (args[1] === "get" && mode === "stale") return { status: 1, stdout: JSON.stringify({ error: { message: "pane not found" } }) };
+      const pane = args[1] === "get" ? (mode === "empty" ? null : { pane_id: "caller" }) : { pane_id: "current" };
+      return { status: 0, stdout: JSON.stringify({ result: { pane } }) };
+    };
+    const { targetPane } = require(${JSON.stringify(require.resolve("../src/herdr"))});
+    for (mode of ["stale", "empty", "healthy"]) {
+      calls = [];
+      assert.equal(targetPane().pane_id, mode === "healthy" ? "caller" : "current");
+      assert.equal(calls.length, mode === "healthy" ? 1 : 2);
+    }
+  `;
+  require("node:child_process").execFileSync(process.execPath, ["-e", script], {
+    env: { ...process.env, HERDR_PLUGIN_CONTEXT_JSON: "{}", HERDR_PANE_ID: "caller" }, windowsHide: true,
+  });
+});
+
+test("session traversal does not silently truncate catalogs at 20,000 files", () => {
+  const root = path.join(os.tmpdir(), "session-graph-large-catalog");
+  const read = fs.readdirSync;
+  fs.readdirSync = function (dir, ...args) {
+    if (dir === root) return [...Array.from({ length: 20000 }, (_, i) => ({
+      name: `${i}.jsonl`, isDirectory: () => false, isFile: () => true,
+    })), { name: "nested", isDirectory: () => true }];
+    if (dir === path.join(root, "nested")) return [{ name: "last.jsonl", isDirectory: () => false, isFile: () => true }];
+    return read.call(this, dir, ...args);
+  };
+  try {
+    const files = walkJsonl(root);
+    assert.strictEqual(files.length, 20001);
+    assert.ok(files.includes(path.join(root, "nested", "last.jsonl")));
+  } finally { fs.readdirSync = read; }
+});
 
 test("search highlights literal case-insensitive matches, CJK columns and matches across wraps", () => {
   assert.deepStrictEqual(matchRanges("A.b a.B axb", "a.b"), [[0, 3], [4, 7]]);

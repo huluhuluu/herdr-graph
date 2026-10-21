@@ -12,10 +12,9 @@
 // Enter read/jump, s history, R rename, f family, d detail tree, n/F resume/fork,
 // t scope, / search, Backspace/Esc back, K keybinding help, ? help, q quit.
 
-const path = require("node:path");
 const herdr = require("./herdr");
 const {
-  ID, targetPane, paneList, focusPane, runInPane, paneGet,
+  targetPane, paneList, focusPane, runInPane, paneGet,
 } = herdr;
 const adapters = require("./adapters");
 const { makeStore, cachedParse } = require("./store");
@@ -28,7 +27,7 @@ const { width: strWidth, truncate, pad, oneLine, wrap } = require("./util");
 
 const SCOPES = ["session", "lineage", "all"];
 const SCOPE_LABEL = {
-  session: "current session",
+  session: "conversation",
   lineage: "full lineage",
   all: "all sessions",
 };
@@ -47,6 +46,7 @@ const HELP = [
   ["F (Shift+F)", "fork saved session / Claude branch"],
   ["t", "cycle scope: session -> lineage -> all"],
   ["s", "browse all saved sessions"],
+  ["c", "read / refresh the caller's current session"],
   ["f / b", "open Family (b is a compatibility alias)"],
   ["d", "Family: structure / conversation tree"],
   ["T (Shift+T)", "hide / show timestamps"],
@@ -114,13 +114,44 @@ class App {
     try { return this.herdr.paneGet(this.callerId); } catch { return null; }
   }
 
+  updateCaller(pane) {
+    const previous = this.initialSession, previousPane = this.callerContext;
+    this.callerContext = pane || null;
+    const session = pane?.agent_session;
+    const adapter = adapters.forAgent(session?.agent || pane?.agent);
+    this.initialSession = adapter && session?.value ? { agent: adapter.id, value: session.value } : null;
+    if (this.initialSession || !adapter) return;
+    const cwd = directoryKey(pane.foreground_cwd || pane.cwd);
+    const title = oneLine(pane.terminal_title_stripped);
+    if (!cwd || !title) return;
+    const suffix = ` | ${cwd.split(/[\\/]/).at(-1)}`;
+    const undecorate = text => adapter.id === "codex" ? text.replace(/^\[[ .!*]+\]\s+Action Required\s+\|\s+/, "") : text;
+    const titles = [title, undecorate(title)];
+    for (const candidate of [...titles]) {
+      if (candidate.toLowerCase().endsWith(suffix.toLowerCase())) titles.push(candidate.slice(0, -suffix.length));
+    }
+    // A native rename may leave the terminal title unchanged until the next turn.
+    const renamedCaller = previous?.agent === adapter.id && this.renamedTitles.has(`${previous.agent}:${previous.value}`) &&
+      pane.pane_id === previousPane?.pane_id && directoryKey(previousPane?.foreground_cwd || previousPane?.cwd) === cwd &&
+      undecorate(oneLine(previousPane?.terminal_title_stripped)) === undecorate(title);
+    const records = this.loader ? this.catalog.values() : this.graph?.sessionMeta?.values() || [];
+    const matches = [...records].filter(meta => meta.agent === adapter.id &&
+      directoryKey(meta.cwd) === cwd && (titles.includes(oneLine(meta.title)) || (renamedCaller && meta.sessionId === previous.value)));
+    if (matches.length === 1) this.initialSession = { agent: adapter.id, value: matches[0].sessionId };
+  }
+
+  isCallerSession(node) {
+    return !!this.initialSession && node?.agent === this.initialSession.agent && node.sessionId === this.initialSession.value;
+  }
+
   load() {
     if (this.loader) { this.loadBackground(); return; }
     let pane = this.callerPane();
+    this.updateCaller(pane);
     this.panes = [];
     try { this.panes = this.herdr.paneList(); } catch {}
 
-    const session = this.activeSession || pane?.agent_session || null;
+    const session = this.activeSession || this.initialSession;
     const agentId = session?.agent || pane?.agent || null;
     const adapter = adapters.forAgent(agentId);
 
@@ -152,6 +183,7 @@ class App {
     }
 
     this.emptyReason = null;
+    this.updateCaller(pane);
     this.cwd = pane?.cwd || this.graph.nodes[0]?.cwd || this.cwd;
     // Land on the last turn of the focused session -- that is where the user is.
     const mine = this.graph.nodes.filter(n => n.isFocusSession);
@@ -178,11 +210,13 @@ class App {
   backgroundMessage(message) {
     if (this.closed) return;
     if (message.type === "caller") {
-      this.initialSession = message.pane?.agent_session;
-      if (this.initialSession) this.initialSession = { ...this.initialSession, agent: this.initialSession.agent || message.pane.agent };
+      this.updateCaller(message.pane);
       this.cwd = message.pane?.cwd || this.cwd;
       this.expandedDirectories.add(directoryKey(this.cwd));
-    } else if (message.type === "panes") this.panes = message.panes;
+    } else if (message.type === "panes") {
+      this.panes = message.panes;
+      if (this.callerId) this.updateCaller(this.panes.find(pane => pane.pane_id === this.callerId));
+    }
     else if (message.type === "catalog") {
       const selectedId = this.current()?.id, previousScroll = this.scroll;
       for (const meta of message.entries) {
@@ -190,19 +224,25 @@ class App {
         if (this.renamedTitles.has(key)) meta.title = this.renamedTitles.get(key);
         if (!previous || (meta.mtime || 0) >= (previous.mtime || 0)) this.catalog.set(key, { ...meta, key, adapter: adapters.byId(meta.agent) });
       }
-      this.catalogComplete = message.complete;
       this.scanStatus = message.complete ? null : `Loading ${message.stage}…`;
       for (const graph of new Set([this.graph, ...this.navigationStack.map(page => page.graph)])) {
         if (!graph) continue;
-        graph.sessionMeta = new Map([...this.catalog].map(([key, entry]) => [key, entry]));
+        const metadata = new Map(graph.sessionMeta);
+        for (const [key, entry] of this.catalog) {
+          if (!metadata.has(key) || (entry.mtime || 0) >= (metadata.get(key).mtime || 0)) metadata.set(key, entry);
+        }
+        graph.sessionMeta = metadata;
         for (const [key, entry] of graph.sessions) if (!graph.sessionMeta.has(key)) graph.sessionMeta.set(key, { ...entry.meta, agent: entry.agent, sessionId: entry.sessionId, file: entry.file });
-        if (graph.scope === "all") Object.assign(graph, adapters.buildGraph({ scope: "all", entries: [...this.catalog.values()] }));
+        if (graph.scope === "all") Object.assign(graph, adapters.buildGraph({ scope: "all",
+          entries: [...graph.sessionMeta].map(([key, entry]) => ({ ...entry, key, adapter: adapters.byId(entry.agent) })),
+          adapter: adapters.byId(graph.focusAgent), sessionId: graph.focusSessionId }));
         else if (graph.scope === "session") {
           const root = graph.sessions.get(graph.focusKey);
           if (root) graph.nodes = adapters.flatten(graph.sessions, root, "session", graph.sessionMeta);
         }
       }
       this._byIdFor = this._relationIdsFor = null;
+      this.updateCaller(this.callerContext);
       if (selectedId) this.selected = Math.max(0, this.nodes().findIndex(row => row.id === selectedId));
       this.scroll = previousScroll;
     } else if (message.type === "page" && message.id === this.loadId) {
@@ -309,7 +349,8 @@ class App {
     if (this.scope === "all") return catalogRows(this.historySessions(), {
       view: this.historyView, order: this.historyOrder, expanded: this.expandedDirectories, collapsed: this.collapsed,
     });
-    const visible = this.graph.nodes.filter(n => this.isVisible(n));
+    const rows = this.loader && this.scope === "lineage" ? this.contentRows() : this.graph.nodes;
+    const visible = rows.filter(n => this.isVisible(n));
     if (this.search) {
       return visible.filter(n => this.matchesSearch(n));
     }
@@ -390,7 +431,9 @@ class App {
   }
 
   byId() {
-    if (this.relationView && this.familyDetail) { this.contentRows(); return this._contentById; }
+    if ((this.relationView && this.familyDetail) || (this.loader && this.scope === "lineage" && !this.relationView)) {
+      this.contentRows(); return this._contentById;
+    }
     if (!this._byId || this._byIdFor !== this.graph) {
       this._byId = new Map((this.graph?.nodes || []).map(n => [n.id, n]));
       this._byIdFor = this.graph;
@@ -500,6 +543,7 @@ class App {
       }
     }
     else {
+      if (this.scope === "lineage") this.requestDetails(familyRows(this.graph, this.graph.focusAgent, this.graph.focusSessionId), true);
       this.renderGraph(G);
       if (D) this.renderDetail(D);
     }
@@ -585,11 +629,13 @@ class App {
       const connX = dotX + 2 + depth * INDENT;
       const foldX = connX + conn.length;
       const labelX = foldX + (fold ? 2 : conn ? 1 : 0);
-      const badge = node.sessionOnly && node.parentSessionId ? "[branch]" : node.forkedChildren?.length ? `[${node.forkedChildren.length} forks]` : "";
-      const room = G.w - (labelX - G.x) - 2 - (badge ? badge.length + 1 : 0);
+      const current = this.isCallerSession(node);
+      const branch = node.sessionOnly && node.parentSessionId ? "[branch]" : node.forkedChildren?.length ? `[${node.forkedChildren.length} forks]` : "";
+      const badges = [{ text: branch, fg: "magenta" }, { text: current ? "[current]" : "", fg: "green" }].filter(badge => badge.text);
+      const badgeWidth = badges.reduce((sum, badge) => sum + badge.text.length + 1, 0);
+      const room = G.w - (labelX - G.x) - 2 - badgeWidth;
 
-      s.text(dotX, y, node.isFocusSession ? "●" : "○",
-        selected ? base : { fg: node.isFocusSession ? "green" : "gray" });
+      s.text(dotX, y, current ? "●" : "○", selected ? base : { fg: current ? "green" : "gray" });
       for (const guide of node.guideDepths || []) s.text(dotX + 2 + Math.min(guide, maxDepth) * INDENT, y, "│", dim);
       s.text(connX, y, conn, dim);
       s.text(foldX, y, fold, dim);
@@ -613,7 +659,11 @@ class App {
       }
       s.highlightedText(labelX, y, this.searchSnippet(label, Math.max(1, room)), this.search, labelStyle);
 
-      if (badge) s.text(G.x + G.w - badge.length - 2, y, badge, selected ? base : { fg: "magenta", bold: true });
+      let badgeX = G.x + G.w - badgeWidth - 1;
+      for (const badge of badges) {
+        s.text(badgeX, y, badge.text, { ...base, fg: badge.fg, bold: true });
+        badgeX += badge.text.length + 1;
+      }
     }
 
     if (list.length > rows) {
@@ -680,15 +730,24 @@ class App {
       const color = { fg: path.has(row.id) ? "cyan" : "white", bold: path.has(row.id) };
       const prefix = row.parentId ? guide + (row.isLast ? "└─ " : "├─ ") : "";
       const fold = row.branchCount ? (row.folded ? "▸ " : "▾ ") : "";
-      const marker = selected ? "▶ " : "○ ";
+      const current = this.isCallerSession(row);
+      const marker = (selected ? "▶ " : current ? "● " : "○ ") + (current ? "[current] " : "");
       const live = !!this.livePaneFor(row.sessionId, row.agent);
       const info = row.parentSessionId && this.relationView ? this.relationInfo(row) : null;
       const point = info ? info.number ? ` [turn ${info.number}]` : info.error ? " [read error]" : info.parentUnavailable ? " [parent missing]" : info.pending ? " [loading…]" : " [turn ?]" : "";
       const suffix = ` · ${this.relationId(row.sessionId)}${point}${row.missing ? " [missing]" : live ? " [running]" : !row.parentId ? " [root]" : ""}`;
       const title = this.searchSnippet(row.title || "(unnamed)", Math.max(4, width - strWidth(prefix + marker + fold + suffix)));
-      lines.push({ text: prefix + marker + fold + title + suffix, style: selected ? { bg: "blue", bold: true } : color, id: row.id, selected });
+      lines.push({ text: prefix + marker + fold + title + suffix, style: selected ? { bg: "blue", bold: true } : color,
+        id: row.id, selected, currentAt: current ? prefix.length + 2 : null });
     }
     return lines;
+  }
+
+  drawRelationLine(x, y, line, width) {
+    const text = truncate(line.text, width);
+    this.screen.highlightedText(x, y, text, this.search, line.style);
+    if (line.currentAt !== null) this.screen.text(x + strWidth(text.slice(0, line.currentAt)), y,
+      text.slice(line.currentAt, line.currentAt + "[current]".length), { ...line.style, fg: "green", bold: true }, 3);
   }
 
   relationId(sessionId) {
@@ -714,7 +773,7 @@ class App {
       const line = lines[this.top + i];
       if (!line) break;
       if (line.selected) this.screen.fill(G.x, G.y + i, G.w, 1, line.style);
-      this.screen.highlightedText(G.x + 2, G.y + i, truncate(line.text, G.w - 4), this.search, line.style);
+      this.drawRelationLine(G.x + 2, G.y + i, line, G.w - 4);
     }
     if (lines.length > G.h) {
       const frac = this.top / Math.max(1, lines.length - G.h);
@@ -812,7 +871,7 @@ class App {
     const start = Math.max(0, selectedLine - budget + 3);
     const visible = lines.slice(start, start + budget);
     this.screen.text(D.x + 2, D.y, `─ relationships · T ${this.showRelationTime ? "hide" : "show"} time ─`, { fg: "magenta", bold: true });
-    visible.forEach((line, i) => this.screen.text(D.x + 2, D.y + 1 + i, truncate(line.text, D.w - 4), line.style));
+    visible.forEach((line, i) => this.drawRelationLine(D.x + 2, D.y + 1 + i, line, D.w - 4));
     let y = D.y + 1 + visible.length;
     if (selected.parentSessionId) this.screen.text(D.x + 2, y++, truncate(branchLabel(info), D.w - 4), { fg: "cyan" });
     if (this.showRelationTime) this.screen.text(D.x + 2, y++, truncate(selected.parentSessionId
@@ -942,7 +1001,7 @@ class App {
       ? "j/k move · h/l fold · f family · d details · T time · Enter jump · s history · R rename · / find · n resume · F fork · Tab content"
       : "j/k scroll · PgUp/PgDn page · Tab back to graph";
     const navigation = this.navigationStack.length ? "Backspace/Esc back · q close · ? help · " : "Esc/q close · ? help · ";
-    s.text(1, y, truncate(navigation + hint, s.width - 2), { fg: this.focus === "graph" ? "white" : "green" });
+    s.text(1, y, truncate("c current · " + navigation + hint, s.width - 2), { fg: this.focus === "graph" ? "white" : "green" });
 
   }
 
@@ -1005,6 +1064,7 @@ class App {
       relationView: this.relationView,
       familyDetail: this.familyDetail,
       selected: this.selected, top: this.top, scroll: this.scroll, focus: this.focus,
+      selectedId: this.current()?.id,
       search: this.search, searchInput: this.searchInput,
       detailSearchLocated: this.detailSearchLocated, searchSelectionPending: this.searchSelectionPending,
       collapsed: new Set(this.collapsed), expandedDirectories: new Set(this.expandedDirectories),
@@ -1014,8 +1074,9 @@ class App {
   }
 
   goBack() {
-    const previous = this.navigationStack.pop();
-    if (!previous) { this.notify("Already at the first page. Press q to close."); return; }
+    const saved = this.navigationStack.pop();
+    if (!saved) { this.notify("Already at the first page. Press q to close."); return; }
+    const { selectedId, ...previous } = saved;
     if (this.loader) {
       this.loader.send({ type: "cancel", id: ++this.loadId });
       this.detailRequests.clear();
@@ -1023,10 +1084,32 @@ class App {
     }
     Object.assign(this, previous);
     if (this.loader && !this.graph) this.loadBackground();
+    const index = this.nodes().findIndex(row => row.id === selectedId);
+    if (index >= 0) this.selected = index;
     this.selected = Math.max(0, Math.min(this.selected, this.nodes().length - 1));
     this.detailSearchLocated = this.detailSearchKey();
     this.message = null;
     this.messageUntil = 0;
+  }
+
+  openCurrentSession() {
+    const pane = this.callerPane();
+    this.updateCaller(pane);
+    if (!this.initialSession) {
+      this.notify("Current session ID unavailable. Open the graph from an agent pane with a reported session ID.", 6000);
+      return;
+    }
+    if (this.graph && (this.scope !== "session" || this.relationView ||
+        !this.isCallerSession({ agent: this.graph.focusAgent, sessionId: this.graph.focusSessionId }))) this.rememberPage();
+    this.activeSession = { ...this.initialSession };
+    this.scope = "session";
+    this.relationView = this.familyDetail = false;
+    this.search = this.detailSearchLocated = null;
+    this.searchInput = "";
+    this.searchSelectionPending = false;
+    this.collapsed.clear();
+    this.focus = "graph";
+    this.load();
   }
 
   jump() {
@@ -1340,6 +1423,8 @@ class App {
         this.cycleScope(); return;
       case "s":
         this.openHistory(); return;
+      case "c":
+        this.openCurrentSession(); return;
       case "b":
         this.openLineage(); return;
       case "T":
@@ -1414,8 +1499,8 @@ class App {
 function openOverlay() {
   // An overlay always attaches to the active pane, so the caller pane is
   // captured here and handed to the pane process through the environment.
-  const pane = targetPane();
   try {
+    const pane = targetPane();
     require("./herdr").openPluginPane({
       entrypoint: "graph",
       placement: "overlay",
