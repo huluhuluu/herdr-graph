@@ -20,7 +20,7 @@
 
 const fs = require("node:fs");
 const path = require("node:path");
-const { oneLine, readHead, readTail, walkJsonl, safeStat, homeDir } = require("../util");
+const { oneLine, readHead, readTail, walkJsonl, safeStat, homeDir, validateSessionMeta } = require("../util");
 const { isHumanText } = require("../noise");
 const { eachRecord } = require("./codex");
 const { sessionEnv } = require("../paths");
@@ -100,7 +100,7 @@ function readMeta(file) {
     title = JSON.parse(fs.readFileSync(sidecar, "utf8")).customTitle || title;
   } catch {}
 
-  return {
+  return validateSessionMeta({
     agent: AGENT,
     // The filename is the identity Herdr reports as agent_session.value, so it
     // is authoritative; the in-record sessionId is kept for reference only.
@@ -115,7 +115,7 @@ function readMeta(file) {
     timestamp: first?.timestamp || null,
     parentSessionId: forkedFrom?.sessionId || null,
     forkMessageUuid: forkedFrom?.messageUuid || null,
-  };
+  });
 }
 
 // Build the in-file DAG and reduce it to human turns.

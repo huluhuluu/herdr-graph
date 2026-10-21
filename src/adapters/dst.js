@@ -4,7 +4,7 @@
 const fs = require("node:fs");
 const path = require("node:path");
 const zlib = require("node:zlib");
-const { homeDir, oneLine, safeStat } = require("../util");
+const { homeDir, oneLine, safeStat, validateSessionMeta } = require("../util");
 const { isHumanText } = require("../noise");
 const { sessionEnv } = require("../paths");
 const META = new Map();
@@ -73,7 +73,7 @@ function frames(buffer) {
 function batches(file) {
   const buffer = fs.readFileSync(file);
   if (!file.endsWith(".zstd")) return [buffer];
-  if (!zlib.zstdDecompressSync) throw new Error("DST compressed sessions require Node.js 24+.");
+  if (!zlib.zstdDecompressSync) throw new Error("DST compressed sessions require Node.js with Zstandard support (22.15+ or 24+).");
   return frames(buffer);
 }
 
@@ -102,14 +102,14 @@ function readMeta(file) {
     const cut = rows.findLast(o => o.type === "session/end-seed" && o.data?.inherited === true);
     if (forkOrdinalExclusive === null && Number.isFinite(cut?.seq)) forkOrdinalExclusive = cut.seq;
   }
-  const meta = {
+  const meta = validateSessionMeta({
     agent: "dst", sessionId: header.id || sessionIdFromFile(file), file,
     title: oneLine(title || header.id?.slice(0, 8) || "DST"),
     cwd: header.cwd || "", version: header.version,
     timestamp: Number.isFinite(header.createdAt) ? new Date(header.createdAt).toISOString() : null,
     parentSessionId: header.parentSession || null,
     forkOrdinalExclusive,
-  };
+  });
   META.set(file, { meta, mtime: st?.mtimeMs, size: st?.size });
   return meta;
 }

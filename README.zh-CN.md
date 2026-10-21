@@ -19,14 +19,14 @@
 
 - [Herdr](https://herdr.dev/docs/install/) **0.9.0+**、**Node.js 18+**，均需位于 Herdr 进程的 `PATH` 中。
 - Git，用于克隆和更新项目。
-- 本地 Codex、Claude Code 或 DST 会话文件。DST 压缩历史需要 **Node.js 24+**。
+- 本地 Codex、Claude Code 或 DST 会话文件。DST 压缩历史需要内置 Zstandard 支持：**Node.js 22.15+（22.x）或 24+**（[Node.js 文档](https://nodejs.org/download/release/v22.22.0/docs/api/zlib.html#zlibzstddecompresssyncbuffer-options)）。
 - 恢复或分叉需要安装相应 agent CLI；Codex、DST 原生改名也需要已安装的 CLI。Claude 改名使用本地标题文件。
 - 交互式终端，建议 **100 列以上**。普通对话双栏需要 72 列，Family 双栏需要 96 列；窄窗口 Family 提供全宽阅读。
 
 | 平台 | 状态 |
 | --- | --- |
 | Windows | 已验证运行 |
-| Linux | manifest 已声明，已检查源码，尚未验证实际运行 |
+| Linux | 已在 Ubuntu 22.04 原生验证，见[验证记录](docs/LINUX-VALIDATION.md) |
 | macOS | manifest 已声明，已检查源码，尚未验证实际运行 |
 
 | Agent | 会话记录位置 |
@@ -38,6 +38,8 @@
 Windows 下的 `~` 指 `%USERPROFILE%`。会话文件必须在运行插件的机器上可访问。
 
 安装器将自定义的 `CODEX_HOME`、`CLAUDE_CONFIG_DIR` 和 `DSH_HOME` 保存到本插件的 `session-roots.json`，因此 Herdr 启动时未继承这些变量也能检索历史。插件进程的环境变量优先。需要更换已保存路径时，设置变量后重新执行 `install`。其他 agent 需要实现适配器，目前没有通用会话解析器。
+
+打开弹窗时会固定这些已解析的目录，避免窗格启动时 shell profile 改写变量、将扫描导向其他目录。Windows 与 Linux 的问题及验证结果见[双系统深度审查](docs/CROSS-PLATFORM-AUDIT.md)。
 
 ## 安装
 

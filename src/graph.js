@@ -13,6 +13,7 @@
 // t scope, / search, Backspace/Esc back, K keybinding help, ? help, q quit.
 
 const herdr = require("./herdr");
+const path = require("node:path");
 const {
   targetPane, paneList, focusPane, runInPane, paneGet,
 } = herdr;
@@ -23,6 +24,7 @@ const { renameSession, forkSession } = require("./native");
 const { directoryKey, filterSessions, catalogRows } = require("./catalog");
 const { Screen, matchRanges, wrapMatches } = require("./ui");
 const { Loader } = require("./loader");
+const { sessionEnv, paneEnv, VARIABLES } = require("./paths");
 const { width: strWidth, truncate, pad, oneLine, wrap } = require("./util");
 
 const SCOPES = ["session", "lineage", "all"];
@@ -80,7 +82,7 @@ class App {
     this.showRelationTime = true;
     this.relationTurns = new Map();
     this.store = opts.store || makeStore();
-    this.env = opts.env || process.env;
+    this.env = paneEnv(opts.env || process.env);
     this.renameSession = opts.renameSession || renameSession;
     this.forkSession = opts.forkSession || forkSession;
     this.historyView = opts.historyView || "directory";
@@ -92,7 +94,7 @@ class App {
     this.activeSession = null;
     this.renameInput = "";
     this.panes = [];
-    this.cwd = opts.cwd || process.cwd();
+    this.cwd = opts.cwd || this.env.SESSION_GRAPH_CWD || process.cwd();
     this.top = 0;
     this.loadId = 0;
     this.catalog = new Map();
@@ -497,25 +499,31 @@ class App {
     const agent = this.graph?.focusAgent ? adapters.byId(this.graph.focusAgent)?.label : "?";
     const sid = this.graph?.focusSessionId ? this.graph.focusSessionId.slice(0, 8) : "--------";
     s.text(1, 0, "Session Graph", { bold: true, fg: "cyan" });
-    s.text(15, 0, `${agent || ""} · ${sid} · ${this.relationView ? this.familyDetail ? "Family · detailed conversations" : "Family · session relationships" : SCOPE_LABEL[this.scope]}`, { fg: "gray" });
+    let rightX = w;
     if (this.graph) {
       const list = this.nodes();
       const n = list.length;
       const pos = n ? `${Math.min(this.selected + 1, n)}/${n}` : "0/0";
       const right = `${pos} ${this.relationView ? "visible" : this.scope === "all" ? "rows" : "nodes"}`;
-      s.text(Math.max(40, w - strWidth(right) - 2), 0, right, { fg: "gray" });
+      rightX = Math.max(15, w - strWidth(right) - 2);
+      s.text(rightX, 0, right, { fg: "gray" });
     }
+    s.text(15, 0, truncate(`${agent || ""} · ${sid} · ${this.relationView ? this.familyDetail ? "Family · detailed conversations" : "Family · session relationships" : SCOPE_LABEL[this.scope]}`, Math.max(0, rightX - 16)), { fg: "gray" });
+    const headerWidth = D && !stacked ? Math.max(0, D.x - 2) : w - 2;
     if (this.relationView && this.graph) {
       const family = familyRows(this.graph, this.graph.focusAgent, this.graph.focusSessionId);
       const missing = family.filter(row => row.missing).length;
       const count = `${family.length - missing} sessions${missing ? ` · ${missing} missing parent` : ""}`;
       const root = family[0];
-      if (root) s.text(1, 1, truncate(`Root: ${truncate(root.title || root.sessionId, Math.max(4, w - count.length - 31))} · ${this.relationId(root.sessionId)} · ${count}`, w - 2), { fg: "cyan" });
+      if (root) s.text(1, 1, truncate(`Root: ${truncate(root.title || root.sessionId, Math.max(4, headerWidth - count.length - 31))} · ${this.relationId(root.sessionId)} · ${count}`, headerWidth), { fg: "cyan" });
     } else if (this.scope === "all" && this.graph) {
       const sessions = this.historySessions();
       const dirs = new Set(sessions.map(n => directoryKey(n.cwd))).size;
       const label = adapters.byId(this.agentFilter)?.label || "All";
-      s.text(1, 1, truncate(`agent: ${label} · ${this.historyView} · ${this.historyOrder} · ${sessions.length} sessions / ${dirs} dirs`, w - 2), { fg: "cyan" });
+      const filters = `agent: ${label} · ${this.historyView} · ${this.historyOrder}`;
+      const count = `${sessions.length} sessions / ${dirs} dirs`;
+      const summary = `${filters} · ${count}`;
+      s.text(1, 1, truncate(strWidth(summary) <= headerWidth ? summary : `${count} · ${filters}`, headerWidth), { fg: "cyan" });
     } else if (this.graph) {
       const family = this.familyFor(this.graph.focusAgent, this.graph.focusSessionId);
       if (family.parent || family.children.length) s.text(1, 1, truncate(`${family.parent ? "1 parent · " : ""}${family.children.length} branches · f family · d details`, G.w - 2), { fg: "magenta" });
@@ -1501,11 +1509,18 @@ function openOverlay() {
   // captured here and handed to the pane process through the environment.
   try {
     const pane = targetPane();
+    const roots = sessionEnv();
     require("./herdr").openPluginPane({
       entrypoint: "graph",
       placement: "overlay",
-      cwd: pane?.cwd || process.cwd(),
-      env: { SESSION_GRAPH_CALLER: pane?.pane_id || "", SESSION_GRAPH_CALLER_CONTEXT: JSON.stringify(pane || null) },
+      // The manifest's script path is relative to the plugin, not the caller.
+      cwd: path.resolve(__dirname, ".."),
+      env: {
+        SESSION_GRAPH_ROOTS: JSON.stringify(Object.fromEntries(VARIABLES.filter(key => roots[key]).map(key => [key, path.resolve(roots[key])]))),
+        SESSION_GRAPH_CWD: pane?.cwd || process.cwd(),
+        SESSION_GRAPH_CALLER: pane?.pane_id || "",
+        SESSION_GRAPH_CALLER_CONTEXT: JSON.stringify(pane || null),
+      },
       focus: true,
     });
   } catch (err) {
@@ -1519,7 +1534,7 @@ if (require.main === module) {
   if (cmd === "open") {
     openOverlay();
   } else {
-    const app = new App({ cwd: process.cwd(), scope: process.env.SESSION_GRAPH_SCOPE || "session" });
+    const app = new App({ scope: process.env.SESSION_GRAPH_SCOPE || "session" });
     try {
       app.run();
     } catch (err) {

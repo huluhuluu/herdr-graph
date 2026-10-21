@@ -18,7 +18,7 @@
 const fs = require("node:fs");
 const path = require("node:path");
 const { StringDecoder } = require("node:string_decoder");
-const { oneLine, readHead, walkJsonl, safeStat, homeDir } = require("../util");
+const { oneLine, readHead, walkJsonl, safeStat, homeDir, validateSessionMeta } = require("../util");
 const { isHumanText } = require("../noise");
 const { sessionEnv } = require("../paths");
 
@@ -88,7 +88,7 @@ function readMeta(file, names = null, env = process.env) {
       if (text && isHumanText(text, AGENT)) { preview = oneLine(text); break; }
     } catch {}
   }
-  return {
+  return validateSessionMeta({
     agent: AGENT,
     sessionId: fileId,
     metaSessionId: meta.session_id || meta.id || null,
@@ -104,7 +104,7 @@ function readMeta(file, names = null, env = process.env) {
     forkOrdinalExclusive: Number.isFinite(meta.forked_from_ordinal_exclusive)
       ? meta.forked_from_ordinal_exclusive : null,
     parentThreadId: meta.parent_thread_id || null,
-  };
+  });
 }
 
 // Yield parsed JSON records one line at a time without buffering the file.

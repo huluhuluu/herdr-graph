@@ -19,14 +19,14 @@ Browsing is read-only. Rename and fork use native agent storage. See [Current li
 
 - [Herdr](https://herdr.dev/docs/install/) **0.9.0+** and **Node.js 18+**, both on the Herdr process's `PATH`.
 - Git for cloning and updating the project.
-- Local Codex, Claude Code or DST session files. DST compressed history requires **Node.js 24+**.
+- Local Codex, Claude Code or DST session files. DST compressed history requires built-in Zstandard support: **Node.js 22.15+ (22.x) or 24+** ([Node.js documentation](https://nodejs.org/download/release/v22.22.0/docs/api/zlib.html#zlibzstddecompresssyncbuffer-options)).
 - Install the relevant agent CLI to resume or fork; native rename also requires the installed Codex or DST CLI. Claude rename uses its local title files.
 - An interactive terminal; **100+ columns** recommended. Two-column conversation views need 72 columns and Family needs 96; narrow Family pages offer a full-width reader.
 
 | Platform | Status |
 | --- | --- |
 | Windows | Runtime verified |
-| Linux | Declared in manifest; code reviewed, runtime not yet verified |
+| Linux | Native runtime verified on Ubuntu 22.04; see [validation notes](docs/LINUX-VALIDATION.md) |
 | macOS | Declared in manifest; code reviewed, runtime not yet verified |
 
 | Agent | Transcript location |
@@ -38,6 +38,8 @@ Browsing is read-only. Rename and fork use native agent storage. See [Current li
 On Windows, `~` means `%USERPROFILE%`. Session files must be accessible on the machine running the plugin.
 
 The installer saves custom `CODEX_HOME`, `CLAUDE_CONFIG_DIR` and `DSH_HOME` values in this plugin's `session-roots.json`, so history remains discoverable if Herdr was started without those variables. The plugin process's environment takes precedence. To change a saved path, set the variable and rerun `install`. Other agents need an adapter; there is no generic transcript parser.
+
+Opening the overlay captures these resolved roots before starting its pane, so a shell profile cannot redirect the scan by changing them during pane startup. Windows and Linux audit findings and validation are recorded in [the cross-platform audit](docs/CROSS-PLATFORM-AUDIT.md).
 
 ## Install
 

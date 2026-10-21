@@ -16,7 +16,9 @@ function cacheFile() {
 
 function load() {
   try {
-    const raw = fs.readFileSync(cacheFile(), "utf8");
+    const file = cacheFile();
+    if (process.platform !== "win32" && fs.lstatSync(file).isFile()) try { fs.chmodSync(file, 0o600); } catch {}
+    const raw = fs.readFileSync(file, "utf8");
     const data = JSON.parse(raw);
     return data?.entries && typeof data.entries === "object" && !Array.isArray(data.entries)
       ? data : { entries: {} };
@@ -26,14 +28,21 @@ function load() {
 }
 
 function save(data) {
+  let tmp;
+  let created = false;
   try {
     const file = cacheFile();
-    fs.mkdirSync(path.dirname(file), { recursive: true });
-    const tmp = `${file}.${process.pid}.tmp`;
-    fs.writeFileSync(tmp, JSON.stringify(data));
+    fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+    tmp = `${file}.${process.pid}.tmp`;
+    const fd = fs.openSync(tmp, "wx", 0o600);
+    created = true;
+    try { fs.writeFileSync(fd, JSON.stringify(data)); } finally { fs.closeSync(fd); }
     fs.renameSync(tmp, file);
+    created = false;
   } catch {
     // A cache write failure must never break the UI.
+  } finally {
+    if (created) try { fs.unlinkSync(tmp); } catch {}
   }
 }
 

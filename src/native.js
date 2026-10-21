@@ -166,7 +166,7 @@ async function renameSession(session, raw, { env = process.env, request = codexR
 
 async function forkSession(session, { env = process.env, request = codexRequest } = {}) {
   if (session.agent !== "codex") throw new Error(`Saved-session fork is not supported for ${session.agent}.`);
-  const result = await request("thread/fork", { threadId: session.sessionId }, { env: sessionEnv(env) });
+  const result = await request("thread/fork", { threadId: session.sessionId, excludeTurns: true }, { env: sessionEnv(env) });
   const id = result?.thread?.id;
   if (!/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(id || "")) throw new Error("Codex did not return a saved fork ID.");
   return id;

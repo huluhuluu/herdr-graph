@@ -34,6 +34,38 @@ test("overlay target falls back from stale pane IDs and preserves a healthy call
   });
 });
 
+test("overlay starts the manifest script from the plugin and retains the caller directory", t => {
+  const caller = fs.mkdtempSync(path.join(os.tmpdir(), "session-graph-caller with spaces-"));
+  t.after(() => fs.rmSync(caller, { recursive: true, force: true }));
+  const script = `
+    const assert = require("node:assert/strict");
+    const fs = require("node:fs");
+    const path = require("node:path");
+    const cp = require("node:child_process");
+    const caller = process.cwd();
+    const pane = { pane_id: "caller", cwd: caller };
+    cp.spawnSync = () => ({ status: 0, stdout: JSON.stringify({ result: { pane } }) });
+    const herdr = require(${JSON.stringify(require.resolve("../src/herdr"))});
+    const { App, openOverlay } = require(${JSON.stringify(require.resolve("../src/graph"))});
+    let launch;
+    herdr.openPluginPane = options => { launch = options; };
+    openOverlay();
+    assert.notEqual(launch.cwd, caller);
+    const manifest = fs.readFileSync(path.join(launch.cwd, "herdr-plugin.toml"), "utf8");
+    const command = JSON.parse(manifest.match(/\\[\\[panes\\]\\][\\s\\S]*?command = (\\[[^\\r\\n]+\\])/)[1]);
+    cp.execFileSync(process.execPath, ["--check", command[1]], { cwd: launch.cwd, windowsHide: true });
+    assert.equal(launch.env.SESSION_GRAPH_CALLER, pane.pane_id);
+    assert.equal(JSON.parse(launch.env.SESSION_GRAPH_ROOTS).CODEX_HOME, path.join(caller, "relative roots"));
+    assert.deepEqual(JSON.parse(launch.env.SESSION_GRAPH_CALLER_CONTEXT), pane);
+    const app = new App({ env: launch.env, store: {} });
+    assert.equal(app.cwd, caller);
+    assert.equal(new App({ env: launch.env, cwd: launch.cwd, store: {} }).cwd, launch.cwd);
+  `;
+  require("node:child_process").execFileSync(process.execPath, ["-e", script], {
+    cwd: caller, env: { ...process.env, CODEX_HOME: "relative roots", HERDR_PLUGIN_CONTEXT_JSON: "{}", HERDR_PANE_ID: "caller" }, windowsHide: true,
+  });
+});
+
 test("session traversal does not silently truncate catalogs at 20,000 files", () => {
   const root = path.join(os.tmpdir(), "session-graph-large-catalog");
   const read = fs.readdirSync;
@@ -49,6 +81,18 @@ test("session traversal does not silently truncate catalogs at 20,000 files", ()
     assert.strictEqual(files.length, 20001);
     assert.ok(files.includes(path.join(root, "nested", "last.jsonl")));
   } finally { fs.readdirSync = read; }
+});
+
+test("directory catalogs handle deep fork chains and keep collapsed descendants hidden", () => {
+  const { catalogRows } = require("../src/catalog");
+  const nodes = Array.from({ length: 12000 }, (_, i) => ({ id: `session-${i}`,
+    parentId: i ? `session-${i - 1}` : null, cwd: "/work/deep", timestamp: "2026-10-21T00:00:00Z" }));
+  const options = { expanded: new Set(["/work/deep"]) };
+  const rows = catalogRows(nodes, options);
+  assert.strictEqual(rows.length, nodes.length + 1);
+  assert.strictEqual(rows.at(-1).depth, nodes.length);
+  assert.deepStrictEqual(catalogRows(nodes, { ...options, collapsed: new Set([nodes[0].id]) })
+    .map(row => row.id), ["directory:/work/deep", nodes[0].id]);
 });
 
 test("search highlights literal case-insensitive matches, CJK columns and matches across wraps", () => {

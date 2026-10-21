@@ -13,6 +13,15 @@ function sessionEnv(env = process.env) {
   return resolved;
 }
 
+function paneEnv(env = process.env) {
+  const resolved = { ...env };
+  try {
+    const roots = JSON.parse(env.SESSION_GRAPH_ROOTS || "{}");
+    for (const key of VARIABLES) if (typeof roots?.[key] === "string" && roots[key]) resolved[key] = roots[key];
+  } catch {}
+  return resolved;
+}
+
 function rememberSessionRoots(env = process.env) {
   const target = path.join(pluginConfigDir(env), "session-roots.json");
   const resolved = sessionEnv(env), roots = {};
@@ -27,4 +36,4 @@ function rememberSessionRoots(env = process.env) {
   return target;
 }
 
-module.exports = { sessionEnv, rememberSessionRoots, VARIABLES };
+module.exports = { sessionEnv, paneEnv, rememberSessionRoots, VARIABLES };

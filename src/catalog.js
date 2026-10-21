@@ -43,11 +43,16 @@ function catalogRows(nodes, { view = "directory", order = "newest", expanded = n
     }
     const rows = [], seen = new Set();
     function walk(node, depth, parentId, visible = true) {
-      if (seen.has(node.id)) return;
-      seen.add(node.id);
-      const kids = (children.get(node.id) || []).filter(n => !seen.has(n.id));
-      if (visible) rows.push({ ...node, depth, parentId, branchCount: kids.length });
-      for (const kid of kids) walk(kid, depth + 1, node.id, visible && !collapsed.has(node.id));
+      const stack = [{ node, depth, parentId, visible }];
+      while (stack.length) {
+        const item = stack.pop();
+        if (seen.has(item.node.id)) continue;
+        seen.add(item.node.id);
+        const kids = (children.get(item.node.id) || []).filter(n => !seen.has(n.id));
+        if (item.visible) rows.push({ ...item.node, depth: item.depth, parentId: item.parentId, branchCount: kids.length });
+        for (let i = kids.length - 1; i >= 0; i--) stack.push({ node: kids[i], depth: item.depth + 1,
+          parentId: item.node.id, visible: item.visible && !collapsed.has(item.node.id) });
+      }
     }
     for (const node of children.get(null) || []) walk(node, 1, null);
     for (const node of sessions) if (!seen.has(node.id)) walk(node, 1, null);

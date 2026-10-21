@@ -12,6 +12,7 @@ const { App } = require("../src/graph");
 const { catalogRows, directoryKey, filterSessions } = require("../src/catalog");
 const { recordsFor, familyRows, edgeInfo, formatTime } = require("../src/relations");
 const { Loader } = require("../src/loader");
+const { width } = require("../src/util");
 const { spawn } = require("node:child_process");
 
 const A = "11111111-1111-4111-8111-111111111111";
@@ -789,6 +790,29 @@ test("compact Family content can focus and scroll on narrow screens without losi
   app.handleKey({ name: "tab" }); app.render();
   app.handleKey({ name: "tab" }); app.render();
   assert.equal(app.scroll, 10, "a temporary return to the tree must preserve the reader offset");
+});
+
+test("header labels keep separate columns in history and both Family layouts", t => {
+  const env = fixture(t);
+  rollout(env, A, ["intro", "main"]);
+  rollout(env, B, ["intro", "branch"], { parent: A, ordinal: 5 });
+  const app = appFor(adapters.buildGraph({ scope: "all", env, store: store() }), env);
+  app.historyView = "time";
+  for (const cols of [58, 80, 118, 160]) {
+    app.screen.cols = cols;
+    app.openHistory();
+    for (const keys of [[], ["f"], ["tab"], ["tab", "d"]]) {
+      for (const name of keys) app.handleKey({ name });
+      app.render();
+      for (const row of app.screen.buffer.slice(0, 2)) {
+        const labels = row.filter(item => item.text.trim()).sort((a, b) => a.x - b.x);
+        for (let i = 1; i < labels.length; i++) {
+          assert.ok(labels[i - 1].x + width(labels[i - 1].text) < labels[i].x,
+            `${cols} columns: ${JSON.stringify(labels)}`);
+        }
+      }
+    }
+  }
 });
 
 test("f opens Family without forking; d shows actual branch turns and replies with preserved numbering", t => {

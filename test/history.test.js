@@ -13,7 +13,7 @@ const codex = require("../src/adapters/codex");
 const claude = require("../src/adapters/claude");
 const dst = require("../src/adapters/dst");
 const native = require("../src/native");
-const { rememberSessionRoots, sessionEnv } = require("../src/paths");
+const { rememberSessionRoots, sessionEnv, paneEnv } = require("../src/paths");
 const { parseKeys } = require("../src/ui");
 const { directoryKey, filterSessions, catalogRows } = require("../src/catalog");
 
@@ -41,15 +41,27 @@ function write(file, rows) {
   return file;
 }
 
-function rollout(env, id, { archived = false, parent = null, cwd = "demo", prompt = "Human prompt" } = {}) {
+function rollout(env, id, { archived = false, parent = null, cwd = "demo", prompt = "Human prompt", provider = "openai" } = {}) {
   return write(path.join(env.CODEX_HOME, archived ? "archived_sessions" : "sessions/2026/10/12", `rollout-2026-10-12T00-00-00-${id}.jsonl`), [
     { type: "session_meta", payload: { id, timestamp: "2026-10-12T00:00:00Z", cwd, source: "cli", originator: "codex_cli_rs",
-      cli_version: "0.162.1", model_provider: "openai", forked_from_id: parent } },
+      cli_version: "0.162.1", model_provider: provider, forked_from_id: parent } },
     { type: "event_msg", ordinal: 1, payload: { type: "task_started", turn_id: `turn-${id}` } },
     { type: "event_msg", ordinal: 2, payload: { type: "user_message", message: prompt } },
     { type: "event_msg", ordinal: 3, payload: { type: "agent_message", message: "Assistant reply" } },
-    { type: "event_msg", ordinal: 4, payload: { type: "task_complete" } },
+    { type: "event_msg", ordinal: 4, payload: { type: "task_complete", turn_id: `turn-${id}` } },
   ].map(row => ({ timestamp: "2026-10-12T00:00:00.000Z", ...row })));
+}
+
+function nativeCodexFixture(t) {
+  const result = fixture(t), { env } = result;
+  fs.mkdirSync(env.CODEX_HOME, { recursive: true });
+  // Metadata tests need no model service or default-model discovery.
+  fs.writeFileSync(path.join(env.CODEX_HOME, "config.toml"), [
+    'model = "session-graph-audit"', 'model_provider = "audit"',
+    '[model_providers.audit]', 'name = "Isolated metadata test"',
+    'base_url = "http://127.0.0.1:9/v1"', 'wire_api = "responses"', "",
+  ].join("\n"));
+  return { ...result, file: rollout(env, A, { cwd: result.root, provider: "audit" }) };
 }
 
 function memoryStore() { return { get: () => null, put() {}, flush() {} }; }
@@ -127,6 +139,54 @@ test("one unreadable session cannot abort the rest of an agent catalog", t => {
       assert.ok(records.find(meta => meta.file === good && !meta.readError));
     } finally { fs.openSync = open; }
   }
+});
+
+test("Claude metadata after a large initial snapshot remains discoverable at read-block boundaries", t => {
+  const { env } = fixture(t);
+  for (const bytes of [256 * 1024, 300 * 1024, 512 * 1024]) {
+    const snapshot = { type: "file-history-snapshot", snapshot: { trackedFileBackups: "" } };
+    snapshot.snapshot.trackedFileBackups = "x".repeat(bytes - Buffer.byteLength(JSON.stringify(snapshot)) - 1);
+    const file = write(path.join(env.CLAUDE_CONFIG_DIR, "projects/demo", `${A}.jsonl`), [snapshot,
+      { type: "user", uuid: "u", cwd: "/work/expected", forkedFrom: { sessionId: B, messageUuid: "parent-message" },
+        message: { content: "Expected user title 中文" } },
+    ]);
+    const meta = claude.readMeta(file);
+    assert.equal(meta.cwd, "/work/expected", `${bytes} bytes`);
+    assert.equal(meta.title, "Expected user title 中文");
+    assert.equal(meta.parentSessionId, B);
+  }
+});
+
+test("malformed metadata remains an error entry without aborting any agent's background scan", async t => {
+  const { env } = fixture(t);
+  env.HERDR_BIN_PATH = path.join(env.CODEX_HOME, "no-herdr");
+  for (const id of [A, B, C]) {
+    rollout(env, id, { cwd: id === A ? { invalid: true } : "/work/good", parent: id === B ? { invalid: true } : null });
+    write(path.join(env.CLAUDE_CONFIG_DIR, "projects/demo", `${id}.jsonl`), [
+      { type: "user", uuid: id, cwd: id === A ? { invalid: true } : "/work/good",
+        forkedFrom: id === B ? { sessionId: { invalid: true } } : null, message: { content: "Human prompt" } },
+    ]);
+    write(path.join(env.DSH_HOME, "sessions/demo", id, "session.v4.jsonl"), [
+      { type: "session", id, cwd: id === A ? { invalid: true } : "/work/good", parentSession: id === B ? { invalid: true } : null },
+    ]);
+  }
+  const catalog = [];
+  let timer, receive;
+  const { Loader } = require("../src/loader");
+  const loader = new Loader(env, message => receive(message));
+  try {
+    await new Promise((resolve, reject) => {
+      timer = setTimeout(() => reject(new Error("Malformed-metadata scan did not complete")), 10000);
+      receive = message => {
+        if (message.type === "error") reject(new Error(message.error));
+        if (message.type === "catalog") { catalog.push(...message.entries); if (message.complete) resolve(); }
+      };
+      loader.send({ type: "start", id: 1, scope: "all", cwd: "/work/good" });
+    });
+  } finally { clearTimeout(timer); await loader.close(); }
+  assert.equal(catalog.length, 9);
+  for (const meta of catalog.filter(row => row.sessionId !== C)) assert.match(meta.readError, /metadata.*must be a string/);
+  assert.equal(catalog.filter(row => row.sessionId === C && !row.readError).length, 3);
 });
 
 test("invalid title-index records and unreadable title indexes do not hide Codex sessions", t => {
@@ -346,6 +406,21 @@ test("installer remembers non-default agent roots for a Herdr server started wit
   assert.equal(codex.listSessions(inherited)[0].sessionId, A);
 });
 
+test("overlay roots survive shell-profile overrides without importing unrelated environment keys", t => {
+  const { env } = fixture(t);
+  rollout(env, A);
+  const original = { CODEX_HOME: env.CODEX_HOME, CLAUDE_CONFIG_DIR: env.CLAUDE_CONFIG_DIR, DSH_HOME: env.DSH_HOME };
+  const changed = { ...env, CODEX_HOME: path.join(env.HOME, "profile-override"),
+    SESSION_GRAPH_ROOTS: JSON.stringify({ ...original, PATH: "unrelated" }) };
+  const app = appFor(changed);
+  assert.equal(app.nodes().find(node => node.sessionId === A).sessionId, A);
+  assert.equal(app.env.CODEX_HOME, env.CODEX_HOME);
+  assert.equal(app.env.PATH, changed.PATH);
+  for (const value of ["null", "[]", "{invalid", '{"CODEX_HOME":42}', '{"CODEX_HOME":""}']) {
+    assert.equal(paneEnv({ ...changed, SESSION_GRAPH_ROOTS: value }).CODEX_HOME, changed.CODEX_HOME);
+  }
+});
+
 test("invalid saved roots do not block history, and a conflicting temporary file is preserved", t => {
   const { env } = fixture(t);
   const target = rememberSessionRoots(env);
@@ -388,6 +463,46 @@ test("malformed caches are rebuilt and benchmarks leave the plugin cache unchang
   assert.match(result.stdout, /cache 1 hit \/ 0 miss/);
   assert.deepEqual(fs.readFileSync(cacheFile()), original);
   assert.deepEqual(fs.readdirSync(env.HERDR_PLUGIN_STATE_DIR), before);
+});
+
+test("parse caches are private and failed or conflicting writes preserve the previous cache", t => {
+  const { env } = fixture(t), file = rollout(env, A);
+  const { makeStore, cacheFile } = require("../src/store");
+  const previous = process.env.HERDR_PLUGIN_STATE_DIR;
+  process.env.HERDR_PLUGIN_STATE_DIR = env.HERDR_PLUGIN_STATE_DIR;
+  t.after(() => {
+    if (previous === undefined) delete process.env.HERDR_PLUGIN_STATE_DIR;
+    else process.env.HERDR_PLUGIN_STATE_DIR = previous;
+  });
+  const store = makeStore();
+  store.put("codex", file, [{ promptFull: "private fixture" }]); store.flush();
+  if (process.platform !== "win32") {
+    assert.equal(fs.statSync(cacheFile()).mode & 0o777, 0o600);
+    assert.equal(fs.statSync(env.HERDR_PLUGIN_STATE_DIR).mode & 0o777, 0o700);
+    fs.chmodSync(cacheFile(), 0o644);
+    assert.equal(makeStore().get("codex", file).length, 1);
+    assert.equal(fs.statSync(cacheFile()).mode & 0o777, 0o600, "existing caches are tightened on read");
+    const external = `${cacheFile()}.external`;
+    fs.copyFileSync(cacheFile(), external); fs.chmodSync(external, 0o644);
+    fs.unlinkSync(cacheFile()); fs.symlinkSync(external, cacheFile());
+    assert.equal(makeStore().get("codex", file).length, 1);
+    assert.equal(fs.statSync(external).mode & 0o777, 0o644, "reading a linked cache must not chmod its target");
+    fs.unlinkSync(cacheFile()); fs.renameSync(external, cacheFile());
+  }
+  const original = fs.readFileSync(cacheFile()), staged = `${cacheFile()}.${process.pid}.tmp`;
+  fs.writeFileSync(staged, "another writer");
+  store.put("codex", file, []); store.flush();
+  assert.equal(fs.readFileSync(staged, "utf8"), "another writer");
+  assert.deepEqual(fs.readFileSync(cacheFile()), original);
+  fs.unlinkSync(staged);
+  const rename = fs.renameSync;
+  fs.renameSync = function (from, to) {
+    if (to === cacheFile()) throw Object.assign(new Error("isolated cache failure"), { code: "EACCES" });
+    return rename.call(this, from, to);
+  };
+  try { store.put("codex", file, []); store.flush(); } finally { fs.renameSync = rename; }
+  assert.deepEqual(fs.readFileSync(cacheFile()), original);
+  assert.equal(fs.existsSync(staged), false, "owned temporary files are removed after a failed replacement");
 });
 
 test("rename UI captures the selected session, persists once, supports cancel and Unicode deletion", async t => {
@@ -633,6 +748,15 @@ test("Codex rename uses only the native metadata method; invalid titles do not d
   await assert.rejects(native.renameSession({ agent: "unknown", sessionId: A }, "name"), /not supported/);
 });
 
+test("Codex fork requests metadata without transferring conversation bodies", async () => {
+  const request = async (method, params) => {
+    assert.equal(method, "thread/fork");
+    assert.deepEqual(params, { threadId: A, excludeTurns: true });
+    return { thread: { id: B } };
+  };
+  assert.equal(await native.forkSession({ agent: "codex", sessionId: A }, { request }), B);
+});
+
 function appServerProcess(autoClose = true) {
   const child = new EventEmitter(), requests = [];
   for (const name of ["stdin", "stdout", "stderr"]) child[name] = new PassThrough();
@@ -704,10 +828,9 @@ test("DST discovers current generations and decodes all frames, preserving reada
 });
 
 test("real Codex metadata rename persists in an isolated CODEX_HOME without starting a turn", async t => {
-  const { env } = fixture(t);
+  const { env } = nativeCodexFixture(t);
   const binary = native.codexBinary(env);
   if (!fs.existsSync(binary)) { t.skip("Codex binary not installed"); return; }
-  rollout(env, A, { cwd: path.dirname(env.CODEX_HOME) });
   await native.renameSession({ agent: "codex", sessionId: A }, "Isolated history test", { env });
   const result = await native.codexRequest("thread/read", { threadId: A, includeTurns: false }, { env });
   assert.equal(result.thread.name, "Isolated history test");
@@ -715,9 +838,8 @@ test("real Codex metadata rename persists in an isolated CODEX_HOME without star
 });
 
 test("real Codex fork creates a resumable saved child without changing its parent or starting a turn", async t => {
-  const { env } = fixture(t);
+  const { env, file } = nativeCodexFixture(t);
   if (!fs.existsSync(native.codexBinary(env))) { t.skip("Codex binary not installed"); return; }
-  const file = rollout(env, A, { cwd: path.dirname(env.CODEX_HOME) });
   const before = fs.readFileSync(file, "utf8");
   const id = await native.forkSession({ agent: "codex", sessionId: A }, { env });
   assert.notEqual(id, A);

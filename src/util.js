@@ -99,13 +99,21 @@ function readHead(file, lines = 1) {
     for (;;) {
       const n = fs.readSync(fd, buf, 0, buf.length, null);
       if (!n) break;
-      // Finish an oversized first record; do not follow later tool-output records.
+      // Finish an oversized first record; keep the following bounded prefix too.
       const newline = buf.subarray(0, n).indexOf(10);
-      const chunk = Buffer.from(buf.subarray(0, chunks.length && newline >= 0 ? newline + 1 : n));
+      const chunk = Buffer.from(buf.subarray(0, n));
       chunks.push(chunk);
       bytes += chunk.length;
       if (bytes > 64 * 1024 * 1024) throw new Error("Session header record exceeds 64 MiB.");
-      if (newline >= 0) break;
+      if (newline >= 0) {
+        // Claude can start with a file snapshot; cwd and title arrive next.
+        // One extra block covers a boundary without following a large tool output.
+        if (lines > 1 && buf.subarray(newline + 1, n).indexOf(10) < 0) {
+          const extra = fs.readSync(fd, buf, 0, buf.length, null);
+          if (extra) chunks.push(Buffer.from(buf.subarray(0, extra)));
+        }
+        break;
+      }
     }
     const head = chunks.length === 1 ? chunks[0] : Buffer.concat(chunks);
     return head.toString("utf8").split("\n").slice(0, lines);
@@ -119,6 +127,15 @@ function readHead(file, lines = 1) {
 
 function safeStat(file) {
   try { return fs.statSync(file); } catch { return null; }
+}
+
+function validateSessionMeta(meta) {
+  for (const key of ["sessionId", "title", "cwd", "parentSessionId"]) {
+    if (meta[key] != null && typeof meta[key] !== "string") {
+      throw new Error(`Invalid ${meta.agent} session metadata: ${key} must be a string.`);
+    }
+  }
+  return meta;
 }
 
 function homeDir(env = process.env) {
@@ -137,4 +154,4 @@ function readTail(file, bytes = 1024 * 1024) {
   } finally { fs.closeSync(fd); }
 }
 
-module.exports = { width, truncate, pad, oneLine, wrap, charWidth, walkJsonl, readHead, readTail, safeStat, homeDir };
+module.exports = { width, truncate, pad, oneLine, wrap, charWidth, walkJsonl, readHead, readTail, safeStat, homeDir, validateSessionMeta };
