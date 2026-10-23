@@ -7,9 +7,15 @@ const { edgeInfo } = require("./relations");
 const { directoryKey } = require("./catalog");
 const herdr = require("./herdr");
 const { safeStat } = require("./util");
+const fs = require("node:fs");
+const path = require("node:path");
+const { TranscriptReader } = require("./transcript-reader");
 
 const store = makeStore(), entries = new Map(), renamed = new Map();
 let pageId = 0, scanning = false, complete = false, flushTimer;
+let progress = null;
+const fullVersions = new Map();
+const signature = st => st && `${st.dev}|${st.ino}|${st.size}|${st.mtimeMs}|${st.ctimeMs}`;
 const yieldIO = () => new Promise(resolve => setImmediate(resolve));
 const send = message => parentPort.postMessage(message);
 const list = () => [...entries.values()].sort((a, b) => b.mtime - a.mtime);
@@ -33,6 +39,100 @@ function portable(graph) {
 function flushLater() {
   clearTimeout(flushTimer);
   flushTimer = setTimeout(() => { store.flush(); }, 500);
+}
+
+function stopProgress() {
+  if (!progress) return;
+  clearTimeout(progress.timer);
+  progress.reader.cancel();
+  progress = null;
+}
+function progressTarget(message) {
+  const adapter = adapters.byId(message.agent);
+  if (!adapter || !message.sessionId) throw new Error("Select a saved session first.");
+  const found = entries.get(`${adapter.id}:${message.sessionId}`);
+  const file = found?.file || message.file || adapters.findSession(message.sessionId, [adapter])?.file;
+  if (!file) throw new Error("Session file is not on disk.");
+  return { adapter, file };
+}
+function progressEnvelope(sub) {
+  return { id: sub.id, subscriptionId: sub.subscriptionId, key: sub.key,
+    sourceEpoch: sub.reader.sourceEpoch, revision: sub.reader.revision,
+    total: sub.reader.log.order.length,
+    activeTurn: sub.reader.log.turn ? { ...sub.reader.log.turn,
+      state: sub.reader.log.states.get(sub.reader.log.turn.key) || "unknown" } : null };
+}
+async function checkProgress(sub, revalidate = false) {
+  if (progress !== sub) return;
+  if (sub.checking) { sub.pending = true; sub.revalidate ||= revalidate; return; }
+  clearTimeout(sub.timer);
+  sub.checking = true;
+  try {
+    // DSH writes new generations in the same session directory.
+    if (sub.agent === "dst" && /^session\.v\d+\./.test(path.basename(sub.reader.file))) {
+      const candidates = fs.readdirSync(path.dirname(sub.reader.file)).filter(name => /^session\.v\d+\.jsonl(?:\.zstd)?$/.test(name));
+      candidates.sort((a, b) => Number(b.match(/\.v(\d+)/)[1]) - Number(a.match(/\.v(\d+)/)[1]));
+      const newest = candidates[0] && path.join(path.dirname(sub.reader.file), candidates[0]);
+      if (newest && newest !== sub.reader.file) { sub.reader.file = newest; revalidate = true; }
+    } else if (!fs.existsSync(sub.reader.file) && Date.now() - (sub.relocatedAt || 0) > 10000) {
+      sub.relocatedAt = Date.now();
+      const found = adapters.findSession(sub.sessionId, [adapters.byId(sub.agent)]);
+      if (found) { sub.reader.file = found.file; revalidate = true; }
+    }
+    const change = await sub.reader.check({ revalidate });
+    if (!change || progress !== sub) return;
+    if (change.changed) {
+      const fullChanged = (change.reset && sub.publishedRevision > 0) || fullVersions.get(sub.key) !== signature(sub.reader.signature);
+      if (fullChanged) store.invalidate(sub.agent, sub.reader.file);
+      if (entries.has(sub.key)) entries.get(sub.key).file = sub.reader.file;
+      const envelope = progressEnvelope(sub);
+      if (change.reset) send({ type: "progress-snapshot", ...envelope, ...sub.reader.window(), changed: true, fullChanged, file: sub.reader.file });
+      else send({ type: "progress-delta", ...envelope, baseRevision: sub.publishedRevision,
+        upserts: change.upserts, changed: true, fullChanged, file: sub.reader.file });
+      sub.publishedRevision = change.revision;
+    }
+    sub.failures = 0;
+    if (sub.history) {
+      const history = sub.history; sub.history = null;
+      send({ type: "progress-snapshot", ...progressEnvelope(sub), ...sub.reader.window(history),
+        history: true, historyId: history.historyId, prepend: !!history.before, append: !!history.after, file: sub.reader.file });
+    }
+    send({ type: "progress-state", ...progressEnvelope(sub), checkedAt: Date.now(),
+      status: change.invalidRecords ? `Skipped ${change.invalidRecords} malformed log record(s)` : "Synced" });
+  } catch (error) {
+    if (progress === sub) {
+      sub.failures = Math.min(4, (sub.failures || 0) + 1);
+      send({ type: "progress-state", ...progressEnvelope(sub), error: error.message, status: "Sync failed; showing last snapshot" });
+    }
+  } finally {
+    sub.checking = false;
+    if (progress === sub) {
+      const pending = sub.pending, force = sub.revalidate;
+      sub.pending = sub.revalidate = false;
+      sub.timer = setTimeout(() => void checkProgress(sub, force), pending ? 0 : Math.min(16000, 2000 * 2 ** (sub.failures || 0)));
+    }
+  }
+}
+
+async function progressMessage(message) {
+  if (message.type === "progress-subscribe") {
+    stopProgress();
+    const { adapter, file } = progressTarget(message);
+    const sub = progress = { id: message.id, subscriptionId: message.subscriptionId,
+      key: `${adapter.id}:${message.sessionId}`, agent: adapter.id, sessionId: message.sessionId,
+      reader: new TranscriptReader(adapter.id, file), publishedRevision: 0 };
+    await checkProgress(sub);
+  } else if (message.type === "progress-unsubscribe") {
+    if (progress?.subscriptionId === message.subscriptionId) stopProgress();
+  } else if (progress?.subscriptionId === message.subscriptionId) {
+    if (message.type === "progress-check") await checkProgress(progress, message.revalidate);
+    else if (message.type === "progress-history") {
+      const sub = progress;
+      if (sub.checking) { sub.history = message; return; }
+      send({ type: "progress-snapshot", ...progressEnvelope(sub), ...sub.reader.window(message),
+        history: true, historyId: message.historyId, prepend: !!message.before, append: !!message.after, file: sub.reader.file });
+    }
+  }
 }
 
 async function scan(cwd, agent) {
@@ -75,7 +175,9 @@ async function details(id, rows, includeTurns = false) {
     const key = `${meta.agent}:${meta.sessionId}`;
     if (turns.has(key)) return turns.get(key);
     try {
+      const before = signature(safeStat(meta.file));
       const value = cachedParse(adapters.byId(meta.agent), meta.file, store);
+      if (before === signature(safeStat(meta.file))) fullVersions.set(key, before);
       turns.set(key, value); return value;
     } catch (error) { errors.set(key, error.message); turns.set(key, null); return null; }
   };
@@ -109,8 +211,10 @@ async function page(message) {
     const meta = adapter.readMeta(file);
     if (meta) remember(meta, adapter);
   }
+  const before = file && signature(safeStat(file));
   const graph = adapters.buildGraph({ adapter, sessionId: session?.value, file,
     scope: family || scope === "lineage" ? "all" : scope, entries: list(), store });
+  if (file && scope === "session" && !family && before === signature(safeStat(file))) fullVersions.set(`${adapter.id}:${session.value}`, before);
   if (family || scope === "lineage") graph.scope = "lineage";
   send({ type: "page", id, graph: portable(graph), scope: family ? "lineage" : scope, complete });
   await yieldIO();
@@ -119,7 +223,17 @@ async function page(message) {
 
 parentPort.on("message", async message => {
   try {
-    if (message.type === "start") {
+    if (message.type.startsWith("progress-")) await progressMessage(message);
+    else if (message.type === "refresh-session") {
+      const { adapter, file } = progressTarget(message);
+      store.invalidate(adapter.id, file);
+      const before = signature(safeStat(file));
+      const turns = cachedParse(adapter, file, store), meta = adapter.readMeta(file);
+      if (before === signature(safeStat(file))) fullVersions.set(`${adapter.id}:${message.sessionId}`, before);
+      send({ type: "session-refreshed", id: message.id, refreshId: message.refreshId,
+        key: `${adapter.id}:${message.sessionId}`, turns, meta, file });
+      flushLater();
+    } else if (message.type === "start") {
       let pane = message.pane?.pane_id === message.callerId ? message.pane : null;
       try { if (!pane && message.callerId) pane = herdr.paneGet(message.callerId); } catch {}
       send({ type: "caller", pane });
@@ -138,5 +252,10 @@ parentPort.on("message", async message => {
     else if (message.type === "panes") {
       try { send({ type: "panes", panes: herdr.paneList() }); } catch {}
     }
-  } catch (error) { send({ type: "error", id: message.id, error: error.message }); }
+  } catch (error) {
+    send({ type: message.type.startsWith("progress-") ? "progress-state" : message.type === "refresh-session" ? "session-refresh-error" : "error",
+      id: message.id, subscriptionId: message.subscriptionId, refreshId: message.refreshId,
+      key: message.agent && message.sessionId ? `${message.agent}:${message.sessionId}` : undefined,
+      error: error.message, status: "Could not read session" });
+  }
 });

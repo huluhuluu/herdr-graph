@@ -49,28 +49,31 @@ function codexRequest(method, params, { env = process.env, binary = codexBinary(
     const child = spawnChild(binary, ["app-server", "--listen", "stdio://"], {
       env, windowsHide: true, stdio: ["pipe", "pipe", "pipe"],
     });
-    let pending = "", stderr = "", stage = "initialize", done = false, result, failure;
-    // Cold startup and local metadata operations can exceed 20 seconds.
-    // Keep a single deadline; never retry a possibly persisted fork.
-    const timer = setTimeout(() => finish(new Error(`Codex App Server timed out during ${stage}.`)), timeout);
+    let pending = "", stderr = "", stage = "initialize", expectedId = 1, done = false, result, failure, timer;
+    // Cold startup must not consume the operation's budget. Each stage is
+    // bounded; notifications never extend it and a fork is never retried.
+    const deadline = () => {
+      clearTimeout(timer);
+      timer = setTimeout(() => finish(new Error(`Codex App Server timed out during ${stage}.` +
+        (stage === "thread/fork" ? " A child may already be saved; check native history before forking again." : ""))), timeout);
+    };
+    deadline();
     const send = message => child.stdin.write(JSON.stringify(message) + "\n");
-    function finish(error) {
+    function finish(error, terminate = true) {
       if (done) return;
       done = true;
       failure = error;
       if (failure && stderr.trim()) failure = new Error(`${error.message}\n${stderr.trim()}`);
       clearTimeout(timer);
-      child.stdin.end();
-      child.kill();
+      if (terminate) { child.stdin.end(); child.kill(); }
     }
     child.on("error", error => finish(error));
     child.stdin.on("error", error => finish(error));
     child.stderr.setEncoding("utf8");
     child.stderr.on("data", chunk => { stderr = (stderr + chunk).slice(-4096); });
-    child.on("exit", code => {
-      if (!done) finish(new Error(`Codex App Server exited before replying (${code}).`));
-    });
-    child.on("close", () => {
+    // exit can precede the final stdout chunk; close follows drained streams.
+    child.on("close", code => {
+      if (!done) finish(new Error(`Codex App Server exited before replying (${code}).`), false);
       if (failure) reject(failure); else resolve(result);
     });
     child.stdout.setEncoding("utf8");
@@ -81,10 +84,12 @@ function codexRequest(method, params, { env = process.env, binary = codexBinary(
         const line = pending.slice(0, end); pending = pending.slice(end + 1);
         let body;
         try { body = JSON.parse(line); } catch { continue; }
-        if (body.method || (body.id !== 1 && body.id !== 2)) continue;
+        if (!body || body.method || body.id !== expectedId) continue;
         if (body.error) { finish(new Error(body.error.message || "Codex request failed.")); break; }
         if (body.id === 1) {
           stage = method;
+          expectedId = 2;
+          deadline();
           send({ method: "initialized", params: {} });
           send({ id: 2, method, params });
         } else { result = body.result; finish(); }
@@ -92,6 +97,7 @@ function codexRequest(method, params, { env = process.env, binary = codexBinary(
     });
     send({ id: 1, method: "initialize", params: {
       clientInfo: { name: "session_graph", title: "Session Graph", version: "0.1.0" },
+      ...(params.deferGoalContinuation ? { capabilities: { experimentalApi: true } } : {}),
     } });
   });
 }
@@ -166,7 +172,8 @@ async function renameSession(session, raw, { env = process.env, request = codexR
 
 async function forkSession(session, { env = process.env, request = codexRequest } = {}) {
   if (session.agent !== "codex") throw new Error(`Saved-session fork is not supported for ${session.agent}.`);
-  const result = await request("thread/fork", { threadId: session.sessionId, excludeTurns: true }, { env: sessionEnv(env) });
+  const result = await request("thread/fork", { threadId: session.sessionId, excludeTurns: true,
+    deferGoalContinuation: true }, { env: sessionEnv(env) });
   const id = result?.thread?.id;
   if (!/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(id || "")) throw new Error("Codex did not return a saved fork ID.");
   return id;

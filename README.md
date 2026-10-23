@@ -11,9 +11,25 @@ Browse and rename local Codex, Claude Code and DST sessions inside [Herdr](https
 - Browse history by directory or time; filter Codex, Claude Code and DST sessions, including archived Codex records.
 - View complete session families, fork turn numbers and detailed prompt trees.
 - Search full prompts and answers with highlighted results and a scrollable reader.
+- Follow public session progress live, with tools and reasoning hidden; switch back to complete output.
 - Rename native sessions; resume or fork in the agent pane that opened the plugin.
 
 Browsing is read-only. Rename and fork use native agent storage. See [Current limitations](#current-limitations) for agent differences.
+
+## Quick reference
+
+With the plugin installed, focus an agent pane and press **Ctrl+B**, release, then **g** (default binding). After updating code, close and reopen existing graph overlays.
+
+| Goal | Keys |
+| --- | --- |
+| Current session / all history | `c` / `s` |
+| Complete output ↔ live progress | `m` |
+| Resume following latest progress | `Tab` to content, then `G` |
+| Read older / newer progress | `PgUp` / `PgDn`; edges load the adjacent page |
+| Family / detailed turn tree | `f` / `d` |
+| Return / close | `Backspace` or `Esc` / `q` |
+
+The **[user guide](docs/USAGE.md)** explains focus, every key, progress states, history paging, native agent differences and troubleshooting. The [Chinese guide](docs/USAGE.zh-CN.md) contains the same feature reference.
 
 ## Requirements
 
@@ -21,12 +37,12 @@ Browsing is read-only. Rename and fork use native agent storage. See [Current li
 - Git for cloning and updating the project.
 - Local Codex, Claude Code or DST session files. DST compressed history requires built-in Zstandard support: **Node.js 22.15+ (22.x) or 24+** ([Node.js documentation](https://nodejs.org/download/release/v22.22.0/docs/api/zlib.html#zlibzstddecompresssyncbuffer-options)).
 - Install the relevant agent CLI to resume or fork; native rename also requires the installed Codex or DST CLI. Claude rename uses its local title files.
-- An interactive terminal; **100+ columns** recommended. Two-column conversation views need 72 columns and Family needs 96; narrow Family pages offer a full-width reader.
+- An interactive terminal; **100+ columns** recommended. Two-column conversations need 72 columns; Family/progress need 96. Narrow Family/progress pages offer a full-width reader.
 
 | Platform | Status |
 | --- | --- |
 | Windows | Runtime verified |
-| Linux | Native runtime verified on Ubuntu 22.04; see [validation notes](docs/LINUX-VALIDATION.md) |
+| Linux | Native runtime verified on Ubuntu 22.04 |
 | macOS | Declared in manifest; code reviewed, runtime not yet verified |
 
 | Agent | Transcript location |
@@ -39,7 +55,7 @@ On Windows, `~` means `%USERPROFILE%`. Session files must be accessible on the m
 
 The installer saves custom `CODEX_HOME`, `CLAUDE_CONFIG_DIR` and `DSH_HOME` values in this plugin's `session-roots.json`, so history remains discoverable if Herdr was started without those variables. The plugin process's environment takes precedence. To change a saved path, set the variable and rerun `install`. Other agents need an adapter; there is no generic transcript parser.
 
-Opening the overlay captures these resolved roots before starting its pane, so a shell profile cannot redirect the scan by changing them during pane startup. Windows and Linux audit findings and validation are recorded in [the cross-platform audit](docs/CROSS-PLATFORM-AUDIT.md).
+Opening the overlay captures these resolved roots before starting its pane, so a shell profile cannot redirect the scan by changing them during pane startup.
 
 ## Install
 
@@ -110,6 +126,8 @@ Cleanup never deletes agent transcripts, other plugins, repository files or conf
 6. Press `f` for **Family**, then `d` to switch between session structure and detailed turns. Branches show their source `[turn N]`; select a turn to read its full question and answer. `T` toggles timestamps, `h/l` fold branches.
 7. Press `Backspace` or `Esc` to return to the previous page, keeping its selection, filters, folds and scroll position. `Esc` closes at the first page; `q` closes from any page. During search or rename, `Esc` cancels editing.
 
+Press `m` on a saved session or turn to read its live progress. Complete output remains the default. See [Live session progress](#live-session-progress).
+
 You can also open it from the agent pane's shell:
 
 ```sh
@@ -121,11 +139,14 @@ herdr plugin action invoke open --plugin huluhlu.session-graph
 | `j` / `k`, `↓` / `↑` | Move between nodes; scroll when content has focus |
 | `g` / `G`, `Home` / `End` | First / last node, or top / bottom of focused content |
 | `h` / `l`, `←` / `→` | Collapse / expand a directory or branch; expand a marked fork to open its family |
-| `Tab` / `Shift+Tab` | Switch tree / detail focus and preserve reading position; narrow Family pages use a full-width reader |
-| `PgUp` / `PgDn` | Page the focused tree in every view; scroll focused content by 10 lines |
-| `Enter` | Directory: expand / collapse; session header: read; Family turn: focus reader; ordinary turn: jump to running pane |
+| `Tab` / `Shift+Tab` | Switch tree / detail focus and preserve position; narrow Family/progress use a full-width reader |
+| `PgUp` / `PgDn` | Page the focused tree; scroll content by 10 lines; progress edges load adjacent history |
+| `Enter` | Directory: expand / collapse; session: open; Family turn: focus reader; ordinary turn: jump; focused progress: return to full |
 | `s` | Show all saved sessions |
 | `c` | Open / refresh the caller's current conversation at its latest saved turn; bypass search and history filters |
+| `m` | Switch complete output / live progress; keep separate reading positions |
+| `p` | Progress: all public assistant text / classified progress only |
+| `r` | Refresh the selected reader; complete output refreshes without resetting selection |
 | `f` | Open the whole family under the common ancestor; repeated presses stay on that page |
 | `d` | Switch Family structure / detailed conversation tree; opens Family when used elsewhere |
 | `b` | Compatibility alias for `f` |
@@ -137,7 +158,7 @@ herdr plugin action invoke open --plugin huluhlu.session-graph
 | `n` | Resume in the current Codex / Claude pane; open DST's native history picker |
 | `F` (`Shift+F`) | Fork the complete saved Codex session and switch to it; branch the current Claude session; unavailable for DST |
 | `t` | Cycle scope: session → lineage → all saved sessions |
-| `/` | History / Family structure: search session metadata; conversation / Family detail: search full questions and answers; empty input clears |
+| `/` | Graph: metadata or full-turn search; focused progress: loaded-window search; empty input clears |
 | `K` / `?` | Key setup instructions / help; scroll help with `j/k` or `PgUp/PgDn` |
 | `Backspace` | Return to the previous page; delete a character when editing |
 | `Esc` | Cancel search / rename or close help; otherwise go back, or close at the first page |
@@ -153,6 +174,16 @@ History expands the caller's directory initially. `v` switches to a flat time li
 Session totals deduplicate native IDs within each agent and include archived Codex records. Scan batches merge with sessions already discovered by opened pages. An unreadable session remains listed with its read error and does not stop other files from being scanned; an unavailable Codex title index falls back to transcript metadata.
 
 `[current]` marks the current session of the agent pane that opened the plugin, even while browsing another session. It appears on graph nodes rather than the header or footer: conversation and history rows show it in green beside the purple branch/fork badges, retaining its color on the selected row. Filled dots identify its turns. Press `c` to read or refresh its saved history, and `Backspace` to return to the previous page. Native identity from Herdr's `agent_session.value` takes priority. Without it, each catalog batch checks for a unique exact match of agent, directory and full terminal session title, so the marker can appear while scanning continues. A later ambiguous match removes the marker. If identity remains unavailable or ambiguous, `c` explains the problem and keeps the page open.
+
+### Live session progress
+
+Select a saved session in history, Family or the conversation tree and press `m`. Progress groups public assistant messages under a short user-question preview, retaining their times and recorded progress/answer types. Tool calls, tool results, thinking blocks and injected context are hidden. Unknown message types remain labelled **Assistant**; `p` filters only explicitly classified progress. `Enter` in the focused progress reader returns to complete output.
+
+The selected session is checked about every 2 seconds in the existing background worker. Only appended JSONL records or complete DST compressed frames are read. Updates become visible after the agent writes them to disk; streaming text that has not been saved cannot be shown. Complete output keeps its existing format and loads the latest known content when you switch back; an updating or failed refresh is labelled.
+
+At the bottom, new messages follow automatically. Scroll up or search to pause following, with a new-message count; press `G` to return to the latest messages. `c` opens the caller's current session in the same reading mode. Changing the caller's native session does not silently replace the conversation you are reading. `r` revalidates the selected log. Switching modes or returning to a saved page preserves reading positions.
+
+The visible window contains up to 400 messages; continue upward/downward at its edges to load adjacent history, `g` requests earliest messages, and `G` loads latest. Old bookmarks load their exact message window. `/` in focused progress searches only the loaded window. Below 96 columns, `Tab` switches tree/full-width content. Unreadable, changed or oversized records produce a visible error and preserve the last successful view. See the [guide](docs/USAGE.md#live-progress) for limits and status meanings.
 
 ### Family and branches
 
@@ -209,7 +240,8 @@ node src/install.js setup-keys
 
 - **Branch records:** only native parent/fork metadata establishes cross-session links. Matching topics do not imply a branch. Missing fork locations are marked; missing parent transcripts cannot be reconstructed. “All” remains a session catalog; `f` opens the family relationship page.
 - **Forking:** Codex copies the saved session history, without a selected-turn boundary. The plugin submits the switch command; any native resume error appears in the agent pane. Claude branching requires a CLI with `/branch` support and a known current session ID.
-- **Refresh and layout:** the 5-second poll updates pane status, not conversation content. Reopen to load new turns. Below 72 columns, the ordinary content column is hidden; both Family views provide a full-width reader.
+- **Codex fork timing:** cold initialization and the metadata operation each have a 60-second limit. A slow CLI or heavily loaded host can still time out. Forks are submitted once; check native history before repeating after a timeout.
+- **Refresh and layout:** progress follows the selected saved log; it cannot see text before the agent saves it. Complete output refreshes with `c` / `r` or when switching back from changed progress. Below 72 columns, ordinary complete-output details are hidden; Family and progress offer a full-width reader. Cold progress loading scans the selected file once before publishing its initial window.
 
 If no history appears, check the agent storage paths above. With a custom agent home, rerun the installer from the shell that sets it. Check `herdr pane list` and the [Herdr integration](https://herdr.dev/docs/integrations/) if opening the current session or jumping to a running pane does not work; these operations use `agent_session.value`.
 
@@ -223,3 +255,10 @@ npm run bench
 Tests cover history, branch trees, search, pane switching, native rename/fork and lifecycle operations. Native Codex/DST checks use temporary agent homes and skip when the CLI is absent. `bench` reads the three largest local Codex and Claude transcripts per agent and compares cold/warm runs in a temporary cache directory, reporting cache hits and misses. Existing sessions and plugin caches remain untouched.
 
 See [Development notes](docs/DEVELOPMENT.md) for the module map and outstanding issues. Keep both READMEs aligned when changing commands, support status, limitations, or the preview.
+
+## Documentation
+
+| Document | Purpose |
+| --- | --- |
+| [User guide](docs/USAGE.md) · [中文手册](docs/USAGE.zh-CN.md) | Complete behavior and key reference; common workflows and troubleshooting |
+| [Development notes](docs/DEVELOPMENT.md) | Modules, data contracts, background updates, caches and checks |

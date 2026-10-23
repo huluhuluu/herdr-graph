@@ -2,13 +2,13 @@
   "name": "herdr-session-graph",
   "version": "0.1.0",
   "private": true,
-  "description": "Browse and rename local agent sessions inside Herdr",
+  "description": "Browse local agent sessions and follow public conversation progress inside Herdr",
   "license": "MIT",
   "engines": {
     "node": ">=18"
   },
   "scripts": {
-    "test": "node --test test/unit.test.js test/install.test.js test/history.test.js test/branches.test.js test/integration.test.js test/behaviour.test.js",
+    "test": "node --test test/unit.test.js test/install.test.js test/history.test.js test/branches.test.js test/integration.test.js test/behaviour.test.js test/progress.test.js",
     "test:unit": "node --test test/unit.test.js test/install.test.js",
     "bench": "node test/bench.js",
     "link": "herdr plugin link .",

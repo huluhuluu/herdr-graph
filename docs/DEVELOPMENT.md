@@ -3,6 +3,8 @@
 Current implementation notes, consolidated from the original design and review.
 These describe v0.1; planned features are not treated as delivered features.
 
+For behavior and key semantics, use the [English user guide](USAGE.md) or [中文使用手册](USAGE.zh-CN.md).
+
 ## Modules
 
 | File | Responsibility |
@@ -12,6 +14,8 @@ These describe v0.1; planned features are not treated as delivered features.
 | `install.sh` / `install.ps1` | Portable entry points to the shared lifecycle manager |
 | `src/graph.js` | App state, rendering, history search, native rename, jump, resume, fork |
 | `src/loader.js` / `src/loader-worker.js` | Worker lifecycle, current-session-first loading, incremental directory catalog and fork details |
+| `src/progress.js` / `src/transcript-reader.js` | Public message projection, identity/branch handling, incremental JSONL/Zstandard reads and indexed history windows |
+| `src/progress-view.js` | Full/progress mode switching, live subscriptions, bookmarks, following, local search and full-output refresh |
 | `src/catalog.js` | Directory normalization, agent/search filters, grouped and time-sorted rows |
 | `src/relations.js` | Native session-parent trees, context previews, fork turn numbers and UTC source times |
 | `src/ui.js` | ANSI screen buffer, style composition, raw keys |
@@ -49,7 +53,7 @@ These describe v0.1; planned features are not treated as delivered features.
 - `[current]` appears directly on graph nodes, never in the header/footer; turn and history rows place it in green beside the purple branch/fork badge, including selected rows. It and filled turn dots identify the caller pane's session independently of the browsed graph's focus. Native pane identity takes priority. When Herdr omits it, each catalog batch checks for a unique exact agent/directory/full terminal title match; the caller folder suffix is removed only when it matches the pane's directory. The marker appears during scanning as soon as a matching session arrives; later duplicate titles revoke it. Other directories cannot establish identity. Pane polls also update that identity. `c` checks the live caller, opens its conversation at the last saved turn and refreshes an already open current conversation without adding a navigation entry. Search and history filters do not block this shortcut; editing still treats `c` as text. A missing or ambiguous caller identity produces a visible message without navigation.
 - On ordinary conversation turns, `Enter` calls `herdr agent focus`; Family turns focus the reader. Resume/fork target only the captured caller pane, require an idle agent of the same type, and use public `herdr pane run` for native slash commands. They never split panes or start another interactive agent. Resume checks current pane listings for duplicate writers; a missing caller is not replaced with another pane.
 - Codex `n` sends `/resume <ID>`. Codex `F` calls App Server `thread/fork`, waits for the helper to close and sends `/resume <child thread.id>` to the existing TUI. The child is persisted without a model turn; the original history is preserved. The whole saved session is copied, without a selected-turn boundary. The caller is rechecked after the async fork; failures display the saved child's ID when available.
-- Codex App Server requests have one 60-second deadline for cold startup and local metadata work. Failures identify the initialization/request stage and retain bounded stderr diagnostics. Requests are never automatically retried, since a timed-out fork may already have been persisted.
+- Codex App Server initialization and the metadata request each have a 60-second deadline, with at most 120 seconds before helper shutdown. Only the expected response ID advances the stage; duplicate initialization replies cannot resubmit a fork. Notifications do not reset timers. Process `close`, rather than `exit`, determines a missing response so final stdout can drain. Failures identify their stage and retain bounded stderr diagnostics. Requests are never retried, since a timed-out fork may already have been persisted. Fork requests include `deferGoalContinuation: true` to defer initial goal continuation on supporting CLIs.
 - Claude `n` sends `/resume <ID>`; `F` sends `/branch` only when the selected session matches the caller's native ID. DST `/resume` ignores ID arguments, so `n` opens its native picker; plugin fork is unavailable. Commands require an empty native composer. Native switching errors are shown in the agent pane.
 - Transcript parsing is local. Viewing does not mutate transcripts; resume and fork delegate changes to the agent CLI.
 - Catalog batches merge with metadata from previously loaded pages instead of replacing those records. Worker-discovered sessions are statted before catalog rows are built, including Family pages opened before the directory scan. Codex/Claude per-file read failures become explicit error entries rather than aborting an adapter's scan. Unavailable Codex title indexes cannot hide readable rollouts. JSONL directory traversal has no silent 20,000-file cutoff; header reads finish an oversized first record (up to 64 MiB) without following later large tool outputs. Non-object JSONL records are ignored.
@@ -62,19 +66,39 @@ These describe v0.1; planned features are not treated as delivered features.
 - Overlay opening falls back to the active pane if a captured pane ID is stale; lookup failures use the normal CLI error path. Detail requests consult the live metadata map after each yield, so an older request cannot restore a missing-parent result after scanning discovers that parent. A locally renamed caller retains its title-resolved identity while the same pane, directory and terminal title remain unchanged (ignoring Codex status decorations); native identity, a different title or ambiguity still take precedence.
 - Overlay processes start in the plugin checkout so the manifest's relative `src/graph.js` path resolves. `SESSION_GRAPH_CWD` separately preserves the caller directory for session discovery and default directory expansion. Starting in the caller directory made native Linux overlays exit immediately outside the plugin checkout; the regression check uses a separate directory containing spaces.
 
+## Progress state and protocol
+
+- `readerMode` chooses full/progress independently of graph scope and Family detail mode. Only one live transcript subscription exists; detailed Family may still load its requested graph turns once.
+- Each subscription carries page ID, subscription ID, file source epoch and revision. History requests add a monotonically increasing `historyId`: a new request replaces prior intent, so G can supersede an older-page request without stale content being appended.
+- History windows support `before`, `after`, `around`, earliest and exact-turn lookups. Before/after windows merge up to 400 messages; a restored bookmark requests its message's window rather than accepting the latest page. An exact turn with no assistant message stays empty, even if later ordinals exist.
+- Bookmarks contain message/field identity and UTF-16 source offset. Newline positions count toward offsets; resizing restores the line containing the bookmarked character. New-message/state rendering captures the anchor before invalidating wrapped lines.
+- Pausing requests a correlated snapshot around the visible message. The worker tracks up to 400 viewed IDs and retains only 400 recent bodies; expired bodies are loaded by record/frame position. A delta transfers at most 400 recent bodies plus updates to at most 400 tracked messages. Existing old-message body changes carry a reload marker; the UI rehydrates that view.
+- Total source message count supplies the unread watermark, independent of a bounded delta's length. Mirror/state updates do not increment it. This avoids undercounting a burst while keeping the UI message count bounded.
+- Indexed history validates file identity, size/times and the confirmed byte boundary before/after hydration. It refuses stale offsets after replacement/truncation rather than mixing a new file's text with old metadata.
+- Full refresh replies preserve the selection at reply time, not request time. Page navigation clears pending refresh state; the refreshed session and direct child edge caches are invalidated without resetting unrelated navigation.
+
+The worker protocol adds `progress-subscribe`, `progress-unsubscribe`, `progress-check`, `progress-history` and `refresh-session`; responses are snapshot, delta, state or full-refresh results. Timers, cursors and descriptors remain in the worker. Navigation saves display state and bookmarks, never active timers. Unchanged EOF records are not decoded repeatedly, and close terminates the worker without a synchronous full-cache write.
+
 ## Outstanding issues / 待修问题
 
 | Area | Current defect or missing capability |
 | --- | --- |
 | Branch metadata | Missing parent files or fork anchors cannot be reconstructed; unknown anchors are marked |
 | Running sessions | Jump and duplicate-resume detection rely on pane identity refreshed by the poll |
-| Small terminals | Below 72 columns ordinary conversation details are hidden; both Family views support a full-width reader |
-| Refresh | New transcript content is not loaded by the pane-status poll |
-| Native Codex startup | An unconfigured cold helper can trigger model discovery and plugin warmup; isolated metadata tests now use an explicit local provider. Production keeps the 60-second deadline and does not retry forks |
+| Small terminals | Below 72 columns ordinary complete-output details are hidden; Family and progress support a full-width reader |
+| Refresh | Progress checks one selected log every 2 seconds; full output refreshes explicitly or after leaving changed progress. Text must already be persisted by the agent |
+| Native Codex startup | An unconfigured cold helper can trigger model discovery and plugin warmup; isolated metadata tests use an explicit local provider. Initialization and the single operation each have a 60-second limit; a slow host or CLI can still exceed it |
+| Codex fork compatibility | Native checks cover Windows CLI 0.164.0 and Linux CLI 0.160.0. Older versions may ignore deferGoalContinuation; no automatic retry or forced goal cancellation is attempted |
 | Agents | Codex, Claude and DST are supported; more agents need explicit adapters |
 | Platforms | Windows and Ubuntu Linux runtime checked; macOS still needs native execution checks |
 
+Complete-output reading remains the default. One cancellable worker subscription reads new bytes/frames, keeps at most 400 public bodies and hydrates older messages by location; graph navigation and complete-output scroll remain independent.
+
 Cache files include `VERSION` in their filename. Bump it when parser behavior changes so unchanged transcripts do not reuse old parsed results.
+
+Cache version 5 also includes ctime and file identity in the validity token, preventing replacement files with preserved size/mtime from reusing stale full output. Progress changes invalidate in-memory family/turn snapshots; returning to full output reloads only the selected transcript without using the page-loading selection reset. Identical initial progress snapshots do not force full reparses. The 5-second pane poll remains separate from the 2-second progress check.
+
+Lifecycle backup names include a timestamp and UUID; same-millisecond edits retain distinct exclusive backups. Worker tests use isolated parse-cache directories. Bootstrap deadlines are separate from ready-worker deadlines; cold Windows initialization does not relax the hot progress refresh assertion.
 
 Branch tests assert actual cross-session parent links, counts, depth-first ordering, copied-history suppression, Claude UUID/DST event anchors, independent roots, idempotent folding, missing/cyclic metadata and 12,000-turn transcripts, including Claude human/tool/assistant parsing without recursion. Relationship checks distinguish direct parent edges from inherited anchors, verify source turn numbers/times, selective preview parsing, fixed preview scrolling, time folding, search ancestor paths, narrow terminals and explicit back navigation. Worker tests exercise staged loading, metadata-first families and turn lineage, late-result rejection, saved selection identity after catalog reordering, and interactive close. Native transport checks cover split responses, single submission, close-before-return and stage-specific timeouts. Cache version 4 invalidates parses affected by UTF-8 characters split across read buffers, as well as older DST epoch timestamps. Files changed during parsing are not cached under their new stat signature.
 
@@ -87,8 +111,6 @@ npm run bench
 
 The suite contains unit, lifecycle, isolated-history/native-rename/fork, local-session integration, and App behavior tests. History checks exercise grouping, filtering, both sort orders, directory keys, compact spacing, caller-only switching and refused commands. Lifecycle checks use isolated temporary Git repositories and stub Herdr calls, including failed validation/reload and concurrent edits. Native checks use isolated agent homes; they skip when the required CLI is absent. The real Codex fork test verifies a readable saved child, its parent link and unchanged original transcript before resuming. Existing session files are never renamed or forked by tests. Passing tests do not establish completeness of the outstanding features above. Benchmarks read the largest local Codex/Claude transcripts with a private temporary cache, report hits/misses and remove that directory on normal completion or a thrown error; forced termination can leave only that temporary directory, never a replaced user cache. Regression coverage also checks malformed cache/root settings and benchmark isolation.
 
-Native Linux lifecycle and terminal checks are recorded in [LINUX-VALIDATION.md](LINUX-VALIDATION.md).
-
-The follow-up [cross-platform audit](CROSS-PLATFORM-AUDIT.md) covers shell-profile root overrides, malformed metadata isolation, deep directory trees, large first records, cache permissions and native helper initialization. Captured overlay roots are restored before worker creation and native operations; ordinary environment values still override installed roots at invocation. Metadata adapters validate identity, title, directory and parent types before yielding records. Parse-cache writes use private exclusive temporary files, clean up failed writes, and tighten existing regular cache files on POSIX without chmodding symlink targets. Catalog traversal is iterative even for collapsed descendants. Codex forks request `excludeTurns` because only the child ID is needed; saved child history is still checked by native tests.
+Cross-platform regressions cover shell-profile root overrides, malformed metadata isolation, deep directory trees, large first records, cache permissions and native helper initialization. Captured overlay roots are restored before worker creation and native operations; ordinary environment values still override installed roots at invocation. Metadata adapters validate identity, title, directory and parent types before yielding records. Parse-cache writes use private exclusive temporary files, clean up failed writes, and tighten existing regular cache files on POSIX without chmodding symlink targets. Catalog traversal is iterative even for collapsed descendants. Codex forks request `excludeTurns` because only the child ID is needed; saved child history is still checked by native tests.
 
 Keep `README.md` and `README.zh-CN.md` synchronized: section order, command blocks, keys, support status, limitations, links and preview must describe the same behavior. The preview uses demo data rendered by the current App.

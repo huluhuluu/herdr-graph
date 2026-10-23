@@ -6,3 +6,10 @@ coverage/
 !.env.example
 .DS_Store
 Thumbs.db
+
+# Local working notes; publish durable usage and development docs instead.
+/docs/DEEP-REVIEW-*.md
+/docs/CROSS-PLATFORM-AUDIT.md
+/docs/LINUX-VALIDATION.md
+/docs/SESSION-PROGRESS-DESIGN.zh-CN.md
+/docs/SESSION-PROGRESS-VALIDATION.md

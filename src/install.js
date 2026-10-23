@@ -6,6 +6,7 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const { spawnSync } = require("node:child_process");
+const { randomUUID } = require("node:crypto");
 const { bin, pluginStateDir } = require("./herdr");
 
 const ROOT = path.resolve(__dirname, "..");
@@ -135,7 +136,7 @@ function writeConfig(target, original, text, execute) {
       throw new Error("Config changed during validation; concurrent edits were preserved. Retry the command.");
     }
     if (original !== null) {
-      backup = `${target}.session-graph-backup-${Date.now()}`;
+      backup = `${target}.session-graph-backup-${Date.now()}-${randomUUID()}`;
       fs.copyFileSync(target, backup, fs.constants.COPYFILE_EXCL);
     }
     fs.renameSync(staged, target);

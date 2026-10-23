@@ -751,7 +751,7 @@ test("Codex rename uses only the native metadata method; invalid titles do not d
 test("Codex fork requests metadata without transferring conversation bodies", async () => {
   const request = async (method, params) => {
     assert.equal(method, "thread/fork");
-    assert.deepEqual(params, { threadId: A, excludeTurns: true });
+    assert.deepEqual(params, { threadId: A, excludeTurns: true, deferGoalContinuation: true });
     return { thread: { id: B } };
   };
   assert.equal(await native.forkSession({ agent: "codex", sessionId: A }, { request }), B);
@@ -797,6 +797,39 @@ test("Codex transport reports timeout stage and stderr without retrying a submit
     assert.equal(server.requests.filter(request => request.method === "thread/fork").length, Number(initialized));
     assert.equal(server.child.killed, true);
   }
+});
+
+test("Codex transport gives a cold initialize and the single metadata operation separate deadlines", async t => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const server = appServerProcess();
+  const pending = native.codexRequest("thread/fork", { threadId: A }, { ...server, binary: "stub", timeout: 60 });
+  t.mock.timers.tick(50);
+  server.reply({ id: 1, result: {} });
+  t.mock.timers.tick(50);
+  server.reply({ id: 2, result: { thread: { id: B } } });
+  assert.deepEqual(await pending, { thread: { id: B } });
+  assert.equal(server.requests.filter(r => r.method === "thread/fork").length, 1);
+});
+
+test("Codex transport ignores duplicate initialize replies instead of submitting another fork", async () => {
+  const server = appServerProcess();
+  const pending = native.codexRequest("thread/fork", { threadId: A, deferGoalContinuation: true }, { ...server, binary: "stub" });
+  assert.deepEqual(server.requests[0].params.capabilities, { experimentalApi: true });
+  server.reply({ id: 1, result: {} });
+  server.reply({ id: 1, result: {} });
+  server.reply({ id: 2, result: { thread: { id: B } } });
+  await pending;
+  assert.equal(server.requests.filter(r => r.method === "thread/fork").length, 1);
+});
+
+test("Codex transport drains a final response after exit before treating close as a failure", async () => {
+  const server = appServerProcess(false);
+  const pending = native.codexRequest("thread/fork", { threadId: A }, { ...server, binary: "stub" });
+  server.reply({ id: 1, result: {} });
+  server.child.emit("exit", 0);
+  server.reply({ id: 2, result: { thread: { id: B } } });
+  server.child.emit("close", 0);
+  assert.deepEqual(await pending, { thread: { id: B } });
 });
 
 const hasZstd = typeof zlib.zstdCompressSync === "function";

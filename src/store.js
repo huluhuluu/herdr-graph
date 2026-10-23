@@ -8,7 +8,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const { pluginStateDir } = require("./herdr");
 
-const VERSION = 4;
+const VERSION = 5;
 
 function cacheFile() {
   return path.join(pluginStateDir(), `parse-cache-v${VERSION}.json`);
@@ -50,7 +50,7 @@ function save(data) {
 function keyFor(adapterId, file) {
   let st;
   try { st = fs.statSync(file); } catch { return null; }
-  return `${adapterId}|${file}|${st.mtimeMs}|${st.size}`;
+  return `${adapterId}|${file}|${st.mtimeMs}:${st.ctimeMs}:${st.dev}:${st.ino}|${st.size}`;
 }
 
 function makeStore() {
@@ -76,6 +76,13 @@ function makeStore() {
     dirty = true;
   }
 
+  function invalidate(adapterId, file) {
+    const prefix = `${adapterId}|${file}|`;
+    for (const key of Object.keys(ensure().entries)) if (key.startsWith(prefix)) {
+      delete data.entries[key]; dirty = true;
+    }
+  }
+
   // Drop entries whose file changed or disappeared, so the cache cannot grow
   // without bound.
   function prune(maxEntries = 400) {
@@ -99,7 +106,7 @@ function makeStore() {
     dirty = false;
   }
 
-  return { get, put, flush, stats: () => ({ hits, misses }) };
+  return { get, put, invalidate, flush, stats: () => ({ hits, misses }) };
 }
 
 // Wrap an adapter's parseTurns with caching.

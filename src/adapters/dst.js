@@ -6,6 +6,7 @@ const path = require("node:path");
 const zlib = require("node:zlib");
 const { homeDir, oneLine, safeStat, validateSessionMeta } = require("../util");
 const { isHumanText } = require("../noise");
+const { textBlocks } = require("../progress");
 const { sessionEnv } = require("../paths");
 const META = new Map();
 
@@ -115,7 +116,7 @@ function readMeta(file) {
 }
 
 function textOf(content) {
-  return typeof content === "string" ? content : (content || []).filter(b => b.type === "text").map(b => b.text).join("\n");
+  return textBlocks(content);
 }
 
 function parseTurns(file) {

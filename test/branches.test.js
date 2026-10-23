@@ -889,16 +889,17 @@ test("background loading publishes the caller before directory history and resol
     for (const waiter of [...waiters]) if (waiter.match(message)) { waiters.splice(waiters.indexOf(waiter), 1); clearTimeout(waiter.timer); waiter.resolve(message); }
   });
   t.after(() => loader.close());
-  const wait = match => {
+  const wait = (match, timeout = 10000) => {
     const existing = messages.find(match);
     if (existing) return Promise.resolve(existing);
     return new Promise((resolve, reject) => {
-      const waiter = { match, resolve, timer: setTimeout(() => reject(new Error(`Loader timeout: ${JSON.stringify(messages.map(m => [m.type, m.error]))}`)), 10000) };
+      const waiter = { match, resolve, timer: setTimeout(() => reject(new Error(`Loader timeout: ${JSON.stringify(messages.map(m => [m.type, m.error]))}`)), timeout) };
       waiters.push(waiter);
     });
   };
   loader.send({ type: "start", id: 1, scope: "session", callerId: "test:p1", cwd: "/work/demo",
     pane: { pane_id: "test:p1", cwd: "/work/demo", agent: "codex", agent_session: { agent: "codex", value: A } } });
+  await wait(m => m.type === "caller", 30000);
   const first = await wait(m => m.type === "page" && m.id === 1);
   assert.equal(first.graph.nodes.length, 2);
   assert.equal(first.graph.sessionMeta.size, 1, "the first conversation does not wait for a global metadata scan");

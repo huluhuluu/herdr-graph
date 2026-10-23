@@ -24,6 +24,7 @@ const { renameSession, forkSession } = require("./native");
 const { directoryKey, filterSessions, catalogRows } = require("./catalog");
 const { Screen, matchRanges, wrapMatches } = require("./ui");
 const { Loader } = require("./loader");
+const { ProgressView } = require("./progress-view");
 const { sessionEnv, paneEnv, VARIABLES } = require("./paths");
 const { width: strWidth, truncate, pad, oneLine, wrap } = require("./util");
 
@@ -49,6 +50,9 @@ const HELP = [
   ["t", "cycle scope: session -> lineage -> all"],
   ["s", "browse all saved sessions"],
   ["c", "read / refresh the caller's current session"],
+  ["m", "switch full output / live session progress"],
+  ["p / r", "progress filter / refresh selected session"],
+  ["G", "content: latest; progress: resume following"],
   ["f / b", "open Family (b is a compatibility alias)"],
   ["d", "Family: structure / conversation tree"],
   ["T (Shift+T)", "hide / show timestamps"],
@@ -100,6 +104,8 @@ class App {
     this.catalog = new Map();
     this.renamedTitles = new Map();
     this.detailRequests = new Set();
+    this.readerMode = "full";
+    this.progressView = new ProgressView(this);
     this.helpTop = 0;
     // Herdr side effects are injectable so behaviour can be tested without
     // touching a live session.
@@ -201,6 +207,9 @@ class App {
   }
 
   loadBackground() {
+    this.progressView.stop();
+    this.progressView.pendingFull = null;
+    this.progressView.fullError = null;
     const session = this.activeSession || this.initialSession;
     this.loading = this.relationView ? "Loading family…" : this.scope === "all" ? "Loading history…" : "Loading session…";
     this.detailRequests.clear();
@@ -211,6 +220,10 @@ class App {
 
   backgroundMessage(message) {
     if (this.closed) return;
+    if (this.progressView.message(message)) {
+      if (this.screen.active) this.render();
+      return;
+    }
     if (message.type === "caller") {
       this.updateCaller(message.pane);
       this.cwd = message.pane?.cwd || this.cwd;
@@ -249,6 +262,7 @@ class App {
       this.scroll = previousScroll;
     } else if (message.type === "page" && message.id === this.loadId) {
       this.graph = message.graph;
+      for (const [key, entry] of this.graph.sessions) if (entry.loaded) this.progressView.dirty.delete(key);
       for (const node of this.graph.nodes) {
         const title = this.renamedTitles.get(`${node.agent}:${node.sessionId}`);
         if (title !== undefined) { node.title = title; if (node.sessionOnly) node.prompt = title; }
@@ -469,6 +483,9 @@ class App {
   layout() {
     const w = this.screen.width;
     const h = this.screen.height;
+    if (this.readerMode === "progress" && w < 96) return this.focus === "detail"
+      ? { stacked: false, graph: { x: 0, y: 2, w: 0, h: 0 }, detail: { x: 0, y: 2, w, h: Math.max(0, h - 4) } }
+      : { stacked: true, graph: { x: 0, y: 2, w, h: Math.max(0, h - 4) }, detail: null };
     if (this.relationView) {
       if (w < 96 && this.focus === "detail") return {
         stacked: false, graph: { x: 0, y: 2, w: 0, h: 0 }, detail: { x: 0, y: 2, w, h: Math.max(0, h - 4) },
@@ -489,6 +506,7 @@ class App {
   }
 
   render() {
+    this.progressView.sync();
     const s = this.screen;
     s.clear();
     const { graph: G, detail: D, stacked } = this.layout();
@@ -536,7 +554,14 @@ class App {
       return;
     }
 
-    if (this.relationView) {
+    if (this.readerMode === "progress") {
+      if (this.relationView && this.familyDetail) this.requestDetails(familyRows(this.graph, this.graph.focusAgent, this.graph.focusSessionId), true);
+      if (G.w) {
+        if (this.relationView && !this.familyDetail) this.renderRelations(G);
+        else this.renderGraph(G);
+      }
+      if (D) this.progressView.render(D);
+    } else if (this.relationView) {
       if (this.familyDetail) {
         this.requestDetails(familyRows(this.graph, this.graph.focusAgent, this.graph.focusSessionId), true);
         this.renderGraph(G);
@@ -556,8 +581,8 @@ class App {
       if (D) this.renderDetail(D);
     }
     if (D && !stacked) s.text(D.x + 2, 1, truncate(this.focus === "detail"
-      ? "Content [focused] · ↑/↓ scroll · Tab tree"
-      : "Content · Tab focus · ↑/↓ scroll", D.w - 4), { fg: this.focus === "detail" ? "green" : "cyan", bold: true });
+      ? `${this.readerMode === "progress" ? "Progress" : "Content"} [focused] · ↑/↓ scroll · Tab tree`
+      : `${this.readerMode === "progress" ? "Progress" : "Content"} · Tab focus · ↑/↓ scroll`, D.w - 4), { fg: this.focus === "detail" ? "green" : "cyan", bold: true });
     // The help box is an overlay on top of the normal frame, drawn in the same
     // pass. Drawing it from the key handler would be wiped by the render that
     // immediately follows key handling.
@@ -769,7 +794,7 @@ class App {
   renderRelations(G) {
     const rows = this.nodes(), node = this.current();
     const family = familyRows(this.graph, this.graph.focusAgent, this.graph.focusSessionId);
-    this.requestDetails(node ? [node, ...family.filter(row => row.id !== node.id)] : family);
+    if (this.readerMode !== "progress") this.requestDetails(node ? [node, ...family.filter(row => row.id !== node.id)] : family);
     if (!node) { this.screen.text(2, G.y + 1, this.search ? "No matching sessions." : "No session relationships to show.", { fg: "gray" }); return; }
     const lines = this.relationLines(rows, node.sessionId, G.w - 4);
     const first = lines.findIndex(line => line.id === node.id);
@@ -989,8 +1014,8 @@ class App {
       s.text(1, s.height - 3, truncate(this.message, s.width - 2), { bold: true, fg: "yellow" });
     }
 
-    if (this.mode === "search" || this.mode === "rename") {
-      const input = this.mode === "rename" ? this.renameInput : this.searchInput;
+    if (this.mode === "search" || this.mode === "rename" || this.mode === "progress-search") {
+      const input = this.mode === "rename" ? this.renameInput : this.mode === "progress-search" ? this.progressView.queryInput : this.searchInput;
       const prefix = this.mode === "rename" ? "Name: " : "/ ";
       s.text(1, y, truncate(prefix + input, Math.max(1, s.width - 2)), { bold: true, fg: "yellow" });
       s.text(prefix.length + 2 + strWidth(input), y, `  (Enter to ${this.mode === "rename" ? "save" : "search"}, Esc to cancel)`, { fg: "gray" });
@@ -1003,13 +1028,20 @@ class App {
       return;
     }
 
+    if (this.readerMode === "progress") {
+      s.text(1, y, truncate("c current · m full · p filter · r refresh · G follow · Tab tree/content · / find · Esc back · q close", s.width - 2), { fg: "green" });
+      return;
+    }
+    if (this.progressView.pendingFull || this.progressView.fullError) s.text(1, sep,
+      truncate(this.progressView.fullError ? ` Refresh failed: ${this.progressView.fullError} · r retry` : " Updating full output; showing previous snapshot…", s.width - 2), { fg: "yellow" });
+
     const hint = this.relationView ? this.focus === "detail" ? "j/k scroll · Tab tree · d toggle detail tree · T time"
       : `j/k ${this.familyDetail ? "turns" : "sessions"} · d ${this.familyDetail ? "structure" : "detail tree"} · h/l fold · Enter read · T time · Tab content · / find · F fork`
       : this.scope === "all" ? "j/k move · Enter open · f family · d details · T time · a agent · v view · o sort · / find · R rename · n resume" : this.focus === "graph"
       ? "j/k move · h/l fold · f family · d details · T time · Enter jump · s history · R rename · / find · n resume · F fork · Tab content"
       : "j/k scroll · PgUp/PgDn page · Tab back to graph";
     const navigation = this.navigationStack.length ? "Backspace/Esc back · q close · ? help · " : "Esc/q close · ? help · ";
-    s.text(1, y, truncate("c current · " + navigation + hint, s.width - 2), { fg: this.focus === "graph" ? "white" : "green" });
+    s.text(1, y, truncate("c current · m progress · " + navigation + hint, s.width - 2), { fg: this.focus === "graph" ? "white" : "green" });
 
   }
 
@@ -1078,13 +1110,15 @@ class App {
       collapsed: new Set(this.collapsed), expandedDirectories: new Set(this.expandedDirectories),
       historyView: this.historyView, historyOrder: this.historyOrder, agentFilter: this.agentFilter,
       historyInitialized: this.historyInitialized, cwd: this.cwd, emptyReason: this.emptyReason,
+      progressState: this.progressView.save(),
     });
   }
 
   goBack() {
     const saved = this.navigationStack.pop();
     if (!saved) { this.notify("Already at the first page. Press q to close."); return; }
-    const { selectedId, ...previous } = saved;
+    const { selectedId, progressState, ...previous } = saved;
+    this.progressView.restore(progressState);
     if (this.loader) {
       this.loader.send({ type: "cancel", id: ++this.loadId });
       this.detailRequests.clear();
@@ -1101,6 +1135,7 @@ class App {
   }
 
   openCurrentSession() {
+    this.progressView.followNext = true;
     const pane = this.callerPane();
     this.updateCaller(pane);
     if (!this.initialSession) {
@@ -1116,7 +1151,7 @@ class App {
     this.searchInput = "";
     this.searchSelectionPending = false;
     this.collapsed.clear();
-    this.focus = "graph";
+    this.focus = this.readerMode === "progress" ? "detail" : "graph";
     this.load();
   }
 
@@ -1336,6 +1371,7 @@ class App {
 
   handleKey(key) {
     if (key.name === "ctrl-c") { this.quit(); return; }
+    if (this.progressView.handleKey(key)) return;
     if (this.mode === "renaming" || this.mode === "switching") return;
     if (this.mode === "rename") {
       if (key.name === "enter") return this.saveRename();
@@ -1455,6 +1491,7 @@ class App {
 
   quit() {
     this.closed = true;
+    this.progressView.stop();
     clearInterval(this.timer);
     this.screen.stop();
     if (this.loader) void this.loader.close();

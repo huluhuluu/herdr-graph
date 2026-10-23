@@ -22,6 +22,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const { oneLine, readHead, readTail, walkJsonl, safeStat, homeDir, validateSessionMeta } = require("../util");
 const { isHumanText } = require("../noise");
+const { textBlocks } = require("../progress");
 const { eachRecord } = require("./codex");
 const { sessionEnv } = require("../paths");
 
@@ -50,16 +51,7 @@ function listSessionFiles(env = process.env) {
 }
 
 function blocksToText(content) {
-  if (typeof content === "string") return content;
-  if (!Array.isArray(content)) return "";
-  const parts = [];
-  for (const b of content) {
-    if (!b) continue;
-    if (b.type === "text" && typeof b.text === "string") parts.push(b.text);
-    else if (b.type === "thinking") continue;
-    // tool_use / tool_result are never human prose.
-  }
-  return parts.join("\n");
+  return textBlocks(content);
 }
 
 function readMeta(file) {

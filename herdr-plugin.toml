@@ -2,7 +2,7 @@ id = "huluhlu.session-graph"
 name = "Session Graph"
 version = "0.1.0"
 min_herdr_version = "0.9.0"
-description = "Browse saved agent sessions, read conversation turns, and rename native sessions"
+description = "Browse saved agent sessions, read complete conversations, follow live progress, and rename sessions"
 platforms = ["windows", "linux", "macos"]
 
 [[actions]]

@@ -20,6 +20,7 @@ const path = require("node:path");
 const { StringDecoder } = require("node:string_decoder");
 const { oneLine, readHead, walkJsonl, safeStat, homeDir, validateSessionMeta } = require("../util");
 const { isHumanText } = require("../noise");
+const { textBlocks } = require("../progress");
 const { sessionEnv } = require("../paths");
 
 const AGENT = "codex";
@@ -187,11 +188,7 @@ function parseTurns(file) {
     }
 
     if (o.type === "response_item" && p.type === "message" && (p.role === "user" || p.role === "assistant")) {
-      const text = (p.content || [])
-        .filter(b => b && (b.type === "input_text" || b.type === "output_text") && typeof b.text === "string")
-        .map(b => b.text)
-        .join("\n")
-        .trim();
+      const text = textBlocks(p.content, ["input_text", "output_text"]).trim();
       if (!text) return;
       const t = ensureTurn(ord, o.timestamp, p.turn_id);
       t.ordEnd = ord;

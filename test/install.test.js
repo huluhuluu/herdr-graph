@@ -146,6 +146,21 @@ test("first-install reload failure removes the newly created config", t => {
   assert.ok(!fs.existsSync(target));
 });
 
+test("same-millisecond key edits create distinct exclusive backups", t => {
+  const root = fixture(t), target = path.join(root, "config.toml");
+  const now = Date.now;
+  Date.now = () => 1234567890;
+  t.after(() => { Date.now = now; });
+  fs.writeFileSync(target, "# original\n");
+  const { execute } = fakeHerdr();
+  const installed = setupKeys({ target, execute });
+  const managed = fs.readFileSync(target, "utf8");
+  const removed = removeKeys({ target, execute });
+  assert.notEqual(installed.backup, removed.backup);
+  assert.equal(fs.readFileSync(installed.backup, "utf8"), "# original\n");
+  assert.equal(fs.readFileSync(removed.backup, "utf8"), managed);
+});
+
 test("install preserves customized managed keys; --no-keys never edits config", t => {
   const root = fixture(t);
   const target = path.join(root, "config.toml");
